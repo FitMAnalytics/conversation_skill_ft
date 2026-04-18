@@ -12,14 +12,17 @@ Build a retrieval system that finds historically similar conversational states a
 ## 2. Transcript Format & Turn Segmentation
 
 ### Raw format
+
 ```
 amex agent (u1): ... \n customer (u2): ... \n amex agent (u3): ... \n customer (u4): ...
 ```
 
 ### Segmentation rule
+
 Divide each transcript into **states**, where each state boundary is defined as **immediately after a customer utterance**. This is the decision point where the agent must choose what to say next.
 
 For a transcript with utterances u1 (agent), u2 (customer), u3 (agent), u4 (customer), ..., the states are:
+
 - State after u2: agent must decide u3
 - State after u4: agent must decide u5
 - etc.
@@ -30,18 +33,23 @@ Each state captures "what has happened so far up to this customer turn."
 
 ## 3. Multi-Scale Embedding Strategy
 
-For each state, construct multiple look-back windows to capture both immediate context and broader conversational dynamics:
+For each state, construct multiple look-back windows to capture both immediate context and broader conversational dynamics.
 
-| Window ID | Content | Captures |
-|-----------|---------|----------|
-| `w1` | Last customer utterance only | Immediate customer intent/request |
-| `w2` | Last 2 turns (1 agent + 1 customer) | Recent exchange dynamics |
-| `w3` | Last 3 turns | Short-term context |
-| `w5` | Last 5 turns | Medium-term topic flow |
-| `w10` | Last 10 turns | Broader conversation arc |
-| `w_summary` | GPT-4.1 structured summary of full context up to this point | Global state |
+**Definition of "turn":** one turn = one exchange = one agent utterance immediately followed by one customer utterance. So "last N turns" means the last N agent utterances and last N customer utterances (i.e., the last 2N utterances, ending on the current customer turn that defines the state).
+
+| Window ID     | Content                                                     | Captures                          |
+| ------------- | ----------------------------------------------------------- | --------------------------------- |
+| `w_0`       | Last customer utterance only                                | Immediate customer intent/request |
+| `w1`        | Last 1 turn (1 agent + 1 customer)                          | Immediate exchange                |
+| `w2`        | Last 2 turns (2 agent + 2 customer)                         | Recent exchange dynamics          |
+| `w3`        | Last 3 turns (3 agent + 3 customer)                         | Short-term context                |
+| `w5`        | Last 5 turns (5 agent + 5 customer)                         | Medium-term topic flow            |
+| `w10`       | Last 10 turns (10 agent + 10 customer)                      | Broader conversation arc          |
+| `w_full`    | Full conversation up to and including the current customer utterance | Complete verbatim context |
+| `w_summary` | GPT-4.1 structured summary of full context up to this point | Global state (compressed)         |
 
 ### Structured summary prompt (for `w_summary`)
+
 Use GPT-4.1 to produce a structured state description before embedding:
 
 ```
@@ -57,53 +65,40 @@ Summarize the following sales call context in this exact format:
 This compensates for ada-2's general-purpose nature by translating conversational dynamics into descriptive text that ada-2 handles well.
 
 ### Design note on overlapping windows
-Windows w1 ⊂ w2 ⊂ w3 ⊂ w5 ⊂ w10 — they overlap. This is intentional for now (simpler implementation). The Optuna weight optimization should learn to downweight redundant signals. If retrieval quality is poor, consider switching to non-overlapping segments (e.g., last utterance, last 2-3 turns, turns 4-10, full summary).
+
+Windows w_0 ⊂ w1 ⊂ w2 ⊂ w3 ⊂ w5 ⊂ w10 ⊂ w_full — they nest. This is intentional for now (simpler implementation). The Optuna weight optimization should learn to downweight redundant signals. If retrieval quality is poor, consider switching to non-overlapping segments (e.g., last customer utterance, last turn, turns 2-3, turns 4-10, earlier context, full summary).
 
 ---
 
 ## 4. Embedding Model
 
-### Primary: `ada-2` (text-embedding-ada-002)
-- Available via `safechain.lcel.model('ada-2')` 
-- 1536-dimensional embeddings
-- 8191 token context window
-- General-purpose; not optimized for dialogue similarity
-
 ### Calling convention
+
 ```python
 from safechain.lcel import model
 embeddings = model('ada-2')
 vector = embeddings.embed_query(text)  # returns list of 1536 floats
 ```
 
-### Known limitations
-- May latch onto surface lexical patterns rather than conversational dynamics
-- The structured summary path (`w_summary`) is the primary mitigation
-- If retrieval quality is insufficient after optimization, fallback plan is to pre-train a domain-specific BERT on transcripts (see Section 9)
-
-### Other available models (not yet accessible via safechain, may require direct API calls)
-- `text-embedding-3-large` (Azure OpenAI): 3072-dim, Matryoshka support, superior quality — available in Amex Azure but not registered in safechain config
-- `bge-large-en` (Launchpad): 512-dim, open-source — accessible at `/genai/google/v1/launchpad/models/bge-large-en/embeddings`
-- `bge-reranker-large` (Launchpad): cross-encoder reranker — could be used as a second-stage reranker if retrieval precision needs improvement
-
----
-
 ## 5. Composite Similarity Metric
 
 Given a query state Q and a candidate state C, the similarity score is a weighted sum of per-window cosine similarities:
 
 ```
-sim(Q, C) = α1 * cos(Q_w1, C_w1) 
-          + α2 * cos(Q_w2, C_w2) 
-          + α3 * cos(Q_w3, C_w3) 
-          + α5 * cos(Q_w5, C_w5) 
-          + α10 * cos(Q_w10, C_w10) 
-          + αs * cos(Q_wsummary, C_wsummary)
+sim(Q, C) = α0    * cos(Q_w0,       C_w0)
+          + α1    * cos(Q_w1,       C_w1) 
+          + α2    * cos(Q_w2,       C_w2) 
+          + α3    * cos(Q_w3,       C_w3) 
+          + α5    * cos(Q_w5,       C_w5) 
+          + α10   * cos(Q_w10,      C_w10) 
+          + αfull * cos(Q_wfull,    C_wfull)
+          + αs    * cos(Q_wsummary, C_wsummary)
 ```
 
-Where `α1 + α2 + α3 + α5 + α10 + αs = 1` (normalized).
+Where `α0 + α1 + α2 + α3 + α5 + α10 + αfull + αs = 1` (normalized).
 
 ### Implementation approach
+
 - Store each window's embedding as a separate vector in a FAISS index (one index per window scale)
 - At query time, compute cosine similarity per window, then combine with weights
 - Alternatively, concatenate weighted embeddings into a single vector for single-index retrieval (but this loses the ability to tune weights without re-indexing)
@@ -121,11 +116,12 @@ Where `α1 + α2 + α3 + α5 + α10 + αs = 1` (normalized).
 At this scale, brute-force `np.dot` on L2-normalized vectors is near-instant and requires no additional dependencies.
 
 ### Index structure
+
 ```python
 import numpy as np
 
 EMBEDDING_DIM = 1536  # ada-2
-WINDOW_NAMES = ['w1', 'w2', 'w3', 'w5', 'w10', 'w_summary']
+WINDOW_NAMES = ['w_0', 'w1', 'w2', 'w3', 'w5', 'w10', 'w_full', 'w_summary']
 
 # Store as dict of numpy arrays, one per window scale
 # Each array has shape (n_states, 1536)
@@ -159,7 +155,9 @@ def retrieve_top_k(query_embeddings: dict, weights: dict, k: int = 5):
 ```
 
 ### Metadata storage
+
 Use a parallel pandas DataFrame where row index aligns with the numpy array index:
+
 - `transcript_id`
 - `state_index` (which customer turn within the transcript)
 - `agent_response` (the agent's next utterance — the response we care about for DPO)
@@ -168,6 +166,7 @@ Use a parallel pandas DataFrame where row index aligns with the numpy array inde
 - Conversion outcome
 
 ### Persistence
+
 ```python
 # Save
 np.savez('embeddings.npz', **embedding_store)
@@ -184,9 +183,11 @@ metadata_df = pd.read_parquet('metadata.parquet')
 ## 7. Weight Optimization via Optuna
 
 ### Objective
+
 Find the weight vector `[α1, α2, α3, α5, α10, αs]` that maximizes retrieval quality as judged by an LLM.
 
 ### Procedure
+
 1. Sample N evaluation states (target: 50-100, stratified by treatment and conversation length)
 2. For each Optuna trial, propose a weight vector
 3. For each evaluation state, retrieve top-5 matches using the proposed weights
@@ -194,6 +195,7 @@ Find the weight vector `[α1, α2, α3, α5, α10, αs]` that maximizes retrieva
 5. Objective = mean LLM similarity rating across all evaluations
 
 ### LLM judge prompt (critical design choice)
+
 Frame around downstream utility, not abstract similarity:
 
 ```
@@ -217,6 +219,7 @@ Respond with only the number.
 ```
 
 ### Optuna configuration
+
 ```python
 import optuna
 
@@ -224,7 +227,7 @@ def objective(trial):
     # Propose weights (Dirichlet-like via softmax of unbounded params)
     raw = [trial.suggest_float(f'w_{name}', 0, 10) for name in window_names]
     weights = [r / sum(raw) for r in raw]
-    
+  
     # Retrieve and evaluate
     scores = []
     for state in eval_states:
@@ -232,7 +235,7 @@ def objective(trial):
         for match in top5:
             score = llm_judge(state, match)
             scores.append(score)
-    
+  
     return np.mean(scores)
 
 study = optuna.create_study(direction='maximize')
@@ -240,11 +243,13 @@ study.optimize(objective, n_trials=50)
 ```
 
 ### Cost estimate
+
 - 50-100 eval states × 5 matches × 50 Optuna trials = 12,500-25,000 LLM judge calls
 - At GPT-4.1 with short prompts, this is manageable but not trivial
 - Consider caching: if the same (query, candidate) pair appears across trials (because only the ranking changed), reuse the rating
 
 ### Validation after optimization
+
 - Take optimized weights, retrieve top-5 for 30+ new states (not in eval set)
 - Manual inspection + LLM re-evaluation on held-out set
 - **Negative validation**: find cases where retrieval says "very similar" but outcomes diverged significantly — these reveal missing dimensions
@@ -256,9 +261,9 @@ study.optimize(objective, n_trials=50)
 ```
 Input: a customer utterance in an ongoing call
 
-1. Segment: extract windows (w1, w2, w3, w5, w10) from conversation so far
+1. Segment: extract windows (w_0, w1, w2, w3, w5, w10, w_full) from conversation so far
 2. Summarize: call GPT-4.1 to produce structured summary (w_summary)
-3. Embed: call ada-2 on each window text → 6 vectors
+3. Embed: call ada-2 on each window text → 8 vectors
 4. Search: query each FAISS index, get top-K candidates per window
 5. Score: compute weighted composite similarity for all unique candidates
 6. Rank: return top-5 by composite score
