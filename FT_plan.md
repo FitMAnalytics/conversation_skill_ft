@@ -138,12 +138,17 @@ Steps:
 
 3. **Construct training examples:** For each substantive agent turn at position `i`, the input is: system prompt + context block + all turns before position `i`. The target is the agent's utterance at position `i`.
 
-### 6.2 Conversation History Windowing
+### 6.2 Truncation Strategy at Training Time
 
-For long conversations that exceed context limits:
-- Include **first 2 turns** (the opening framing matters)
-- Include **last K-2 turns** as the immediate context window (K ≈ 20 should cover most calls)
-- This preserves both the call opening and recent conversational context
+Each training example is packed as `prefix + target + EOS` and normalized to a fixed `MAX_SEQ_LEN` (right-padded with `-100` labels on pad tokens). Section-aware truncation handles over-budget examples:
+
+- **Preserve the system prompt and `<|context|>` block intact.** They define the model's identity and factual grounding — truncating them trains the model on inputs that don't match inference-time prompts.
+- **Preserve the target (next agent utterance) + EOS verbatim.** Keeps the loss boundary clean and always trains on a complete stopping signal.
+- **Drop the oldest turns from inside `<|conversation|>...<|/conversation|>` first.** Recency dominates next-turn prediction, so the earliest turns lose the least signal per token removed.
+- **Last-resort fallback:** if `system + context + target` alone already exceed `MAX_SEQ_LEN`, the head (system + context) is left-truncated. This should be essentially never triggered with a sensibly-chosen `MAX_SEQ_LEN`; the preprocessing notebook prints a counter for this case.
+- **Pick `MAX_SEQ_LEN` from the data.** Compute the 95-99th percentile of actual `prefix + target + EOS` token lengths and set `MAX_SEQ_LEN` just above that. Going larger wastes compute on padding (attention is super-linear in sequence length); going smaller truncates real content.
+
+Sequence packing (concatenating multiple short examples per row with per-segment masks) is an optional future optimization when length variance is high; v1 uses plain right-padding for simplicity.
 
 ### 6.3 System Prompt Consistency
 
@@ -151,10 +156,20 @@ Use a **single fixed system prompt** across all training examples. Do not custom
 
 ## 7. What to Build First (v1 Scope)
 
-1. **Preprocessing script:** Raw transcripts → cleaned, turn-segmented, formatted training examples as described above.
-2. **Data validation:** Verify token distributions, check for truncation at max context length, confirm loss masking is correct.
-3. **SFT training run:** QLoRA on GPT-OSS-120B with the formatted data.
-4. **Evaluation:** Manual qualitative review of generated responses on held-out conversations. Check for: fluency, on-topic responses, appropriate tone, reasonable objection handling.
+Implemented as a four-notebook pipeline:
+
+1. **`00_generate_fake_data.ipynb`** — synthetic outbound-sales transcripts in the raw `agent(uN): ... / customer(uN): ...` format described in §5, each with a binary `label`. Used while real transcripts are unavailable and as a smoke test for the preprocessing / training code paths.
+
+2. **`01_preprocessing.ipynb`** — Raw transcripts → training examples. Parses the alternating-turn format, filters trivial agent turns (<15 tokens) from being used as generation targets, emits one example per substantive agent turn in the `<|system|> / <|context|> / <|conversation|> / <|agent|>` template with loss masking on everything before the final `<|agent|>`. Randomly populates `<|context|>` on 10-20% of examples with metadata-derived text so the model learns to attend to that slot for Layer 2.
+
+3. **`02_sft_training.ipynb`** — QLoRA on GPT-OSS-120B. Includes:
+   - **Token-length distribution check:** histograms + percentiles (p50/p75/p90/p95/p99/max) over `prefix + target + EOS` lengths to pick `MAX_SEQ_LEN` from the data (§6.2).
+   - **Section-aware truncation:** preserves system prompt, `<|context|>` block, and target verbatim; drops oldest turns from inside `<|conversation|>…<|/conversation|>` first; counts how many examples hit conversation-level vs. head-level truncation.
+   - 8 registered special tokens with `resize_token_embeddings`, loss masked to the agent-response span, LoRA adapter saved to `checkpoints/final_adapter/`.
+
+4. **`03_inference.ipynb`** — Loads the base model in 4-bit + attaches the LoRA adapter. Exposes `generate_agent_response(system_prompt, context, conversation_history)` using the exact training-time template, with stop tokens on `<|customer|>`, `<|/conversation|>`, and EOS. Also provides an interactive chat cell and a **base-model-only** variant (`generate_base_response`) that wraps `model.generate` in `with model.disable_adapter():` for direct base-vs-fine-tuned A/B comparison without reloading weights.
+
+**Evaluation (v1):** manual qualitative review of generated responses on held-out conversations — fluency, on-topic responses, appropriate tone, reasonable objection handling — plus side-by-side inspection against the base-model baseline to confirm the adapter is actually changing behavior in the intended direction.
 
 ## 8. Future Layers (Not In Scope for v1)
 
@@ -163,6 +178,8 @@ Use a **single fixed system prompt** across all training examples. Do not custom
 Construct contrastive pairs: at critical conversation moments (objection raised, closing attempt, need discovery), pair the winning agent's response (chosen) with a weaker response (rejected). The rejected response can come from lower-performing agents on similar calls, or from the SFT model's own generations that a human reviewer rates as inferior.
 
 DPO trains directly on preference pairs without needing a reward model, making it cheaper than full RL while still providing negative signal.
+
+**Infrastructure reuse:** the multi-scale state-retrieval system described in `rag_architecture.md` is the mechanism for finding "similar states" across transcripts. Given a state from a winning call, retrieve the closest states from losing calls; the winning agent's response becomes `chosen` and the losing agent's response becomes `rejected`. This turns the retrieval system into a preference-pair-mining pipeline.
 
 ### 8.2 Product RAG (Layer 2, Phase 2)
 

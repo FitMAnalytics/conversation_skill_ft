@@ -111,7 +111,7 @@ Where `α0 + α1 + α2 + α3 + α5 + α10 + αfull + αs = 1` (normalized).
 
 ### Choice: Pure numpy (brute-force cosine similarity)
 
-**Scale**: ~400-500 transcripts × 10-200 utterances × ~50% are customer turns = roughly 10K-50K states, each with 6 embedding windows.
+**Scale**: ~400-500 transcripts × 10-200 utterances × ~50% are customer turns = roughly 10K-50K states, each with 7-8 embedding windows (7 when `USE_SUMMARY=False`, 8 when summaries are included).
 
 At this scale, brute-force `np.dot` on L2-normalized vectors is near-instant and requires no additional dependencies.
 
@@ -156,14 +156,17 @@ def retrieve_top_k(query_embeddings: dict, weights: dict, k: int = 5):
 
 ### Metadata storage
 
-Use a parallel pandas DataFrame where row index aligns with the numpy array index:
+Use a parallel pandas DataFrame (persisted as parquet) where row index aligns with the numpy array index. Actual implemented schema in `RAG_01_indexing.ipynb`:
 
-- `transcript_id`
-- `state_index` (which customer turn within the transcript)
-- `agent_response` (the agent's next utterance — the response we care about for DPO)
-- `treatment` (topic label)
-- `agent_id` (for filtering by performance tier)
-- Conversion outcome
+- `conversation_id` — which transcript the state came from
+- `state_index` — sequential index of this state within the conversation (0-indexed over customer turns)
+- `state_turn_idx` — utterance index in the raw transcript of the customer turn that closes this state
+- `agent_response` — the agent's next utterance (the response we care about for DPO)
+- `agent_response_turn_idx` — utterance index of `agent_response` in the raw transcript
+- `w_0_text`, `w1_text`, `w2_text`, `w3_text`, `w5_text`, `w10_text`, `w_full_text` — raw text of each window
+- `w_summary_text` — GPT-4.1 summary (only present when `USE_SUMMARY=True`)
+- `n_turns_available` — how many prior turns actually existed (for diagnostics of short-context states)
+- `label` — conversion outcome for the source transcript
 
 ### Persistence
 
@@ -184,7 +187,7 @@ metadata_df = pd.read_parquet('metadata.parquet')
 
 ### Objective
 
-Find the weight vector `[α1, α2, α3, α5, α10, αs]` that maximizes retrieval quality as judged by an LLM.
+Find the weight vector `[α0, α1, α2, α3, α5, α10, αfull, αs]` that maximizes retrieval quality as judged by an LLM. (When `USE_SUMMARY=False`, drop `αs` and renormalize over the remaining seven.)
 
 ### Procedure
 
@@ -295,5 +298,4 @@ This way the evaluation infrastructure built for ada-2 becomes training data for
 - [ ] Determine if bge-reranker-large is accessible via direct API call for two-stage retrieval
 - [ ] Decide on non-overlapping vs overlapping windows based on initial retrieval quality
 - [ ] Define the evaluation state sampling strategy (stratification criteria)
-- [ ] Determine how to handle states early in calls where w10 or w5 may not exist (pad? skip? use only available windows?)
 - [ ] Build conversion probability predictor (separate component) to enable ΔP-based preference pair construction
