@@ -84,6 +84,9 @@ def parse_args() -> argparse.Namespace:
                         "DeepSpeed JSON config. Omit for single-GPU training.")
     p.add_argument("--max-samples", type=int, default=None,
                    help="Train on only the first N examples — for smoke-testing the pipeline.")
+    # The `deepspeed` launcher injects --local_rank=N per rank. Absorb it so argparse
+    # doesn't reject it; Trainer reads the actual value from the LOCAL_RANK env var.
+    p.add_argument("--local_rank", type=int, default=-1, help=argparse.SUPPRESS)
     return p.parse_args()
 
 
@@ -249,6 +252,14 @@ def main() -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     ds_config = resolve_deepspeed(args.deepspeed)
+
+    # CRITICAL: must register the DS config BEFORE from_pretrained so ZeRO-3 partitions
+    # parameters during model construction (via deepspeed.zero.Init). Without this,
+    # every rank materializes the full 120B model and OOMs CUDA. The handle must stay
+    # in scope — HfDeepSpeedConfig holds the global registration via a weakref.
+    if ds_config is not None:
+        from transformers.integrations import HfDeepSpeedConfig
+        _dschf = HfDeepSpeedConfig(ds_config)  # noqa: F841 — keep alive for the rest of main()
 
     logging.info("Run config: %s", vars(args))
 
