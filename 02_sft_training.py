@@ -1,12 +1,25 @@
-"""QLoRA / LoRA SFT training for the outbound-sales conversation model.
+"""LoRA SFT training for the outbound-sales conversation model.
 
 Reads `data/train_examples.jsonl` (produced by `01_preprocessing.ipynb`) and
-fine-tunes the base model with LoRA adapters. Loss is computed only on the
-`cleaned_target` field — the prefix is masked with -100.
+fine-tunes the base model with LoRA adapters in bf16. Loss is computed only on
+the `cleaned_target` field — the prefix is masked with -100.
 
-Two quantization modes:
-    --quantization lora   (default) full bf16 weights, no bitsandbytes
-    --quantization qlora  4-bit nf4 + double-quant via bitsandbytes
+For GPT-OSS-120B the model is sharded across the node with DeepSpeed ZeRO-3.
+The base weights are MXFP4-native, so no extra bnb/QLoRA quantization is used.
+
+Launch:
+    # Single-GPU LoRA (debug / small base models):
+    python 02_sft_training.py --epochs 3
+
+    # 8-GPU ZeRO-3 (production run for GPT-OSS-120B):
+    deepspeed --num_gpus=8 02_sft_training.py --deepspeed zero3 --epochs 3
+
+    # Smoke-test the full pipeline on 30 samples (one short epoch):
+    deepspeed --num_gpus=8 02_sft_training.py --deepspeed zero3 \\
+        --max-samples 30 --epochs 1
+
+    # Multi-node: use a hostfile.
+    deepspeed --hostfile=hostfile --num_gpus=8 02_sft_training.py --deepspeed zero3
 
 Logs:
     - Python `logging` to stdout (status, wall-clock time)
@@ -20,13 +33,11 @@ import logging
 import time
 from pathlib import Path
 
-import torch
 from datasets import Dataset
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, get_peft_model
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    BitsAndBytesConfig,
     Trainer,
     TrainingArguments,
 )
@@ -63,14 +74,59 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--model-dir", default=DEFAULT_MODEL_DIR,
                    help="Local base-model checkpoint directory")
-    p.add_argument("--quantization", choices=["lora", "qlora"], default="lora",
-                   help="lora = full bf16 weights; qlora = 4-bit nf4 via bitsandbytes")
     p.add_argument("--data-file", default=DEFAULT_DATA_FILE,
                    help="Training JSONL with prefix + cleaned_target fields")
     p.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR,
                    help="Where checkpoints, TensorBoard runs, and the adapter land")
     p.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    p.add_argument("--deepspeed", default=None,
+                   help="Pass 'zero3' for the built-in ZeRO-3 preset, or a path to a custom "
+                        "DeepSpeed JSON config. Omit for single-GPU training.")
+    p.add_argument("--max-samples", type=int, default=None,
+                   help="Train on only the first N examples — for smoke-testing the pipeline.")
     return p.parse_args()
+
+
+def build_zero3_config() -> dict:
+    """Inline ZeRO-3 config tuned for LoRA fine-tuning of GPT-OSS-120B on an 8-GPU node.
+
+    Param + optimizer states are CPU-offloaded because the unsharded 120B base model
+    plus activations does not fit in 8x80GB. `stage3_gather_16bit_weights_on_model_save`
+    is the critical knob for the save-time gather — without it, save_pretrained either
+    writes shard fragments or has every rank try to gather full weights at once (OOM).
+    """
+    return {
+        "bf16": {"enabled": True},
+        "zero_optimization": {
+            "stage": 3,
+            "offload_param":     {"device": "cpu", "pin_memory": True},
+            "offload_optimizer": {"device": "cpu", "pin_memory": True},
+            "overlap_comm": True,
+            "contiguous_gradients": True,
+            "reduce_bucket_size": "auto",
+            "stage3_prefetch_bucket_size": "auto",
+            "stage3_param_persistence_threshold": "auto",
+            "stage3_max_live_parameters": 1e9,
+            "stage3_max_reuse_distance": 1e9,
+            "stage3_gather_16bit_weights_on_model_save": True,
+        },
+        "gradient_accumulation_steps": "auto",
+        "gradient_clipping": "auto",
+        "train_micro_batch_size_per_gpu": "auto",
+        "train_batch_size": "auto",
+    }
+
+
+def resolve_deepspeed(arg: str | None):
+    """Translate the --deepspeed CLI value into what TrainingArguments expects."""
+    if arg is None:
+        return None
+    if arg == "zero3":
+        return build_zero3_config()
+    cfg_path = Path(arg)
+    if not cfg_path.is_file():
+        raise FileNotFoundError(f"DeepSpeed config not found: {cfg_path}")
+    return str(cfg_path)
 
 
 def load_and_tokenize(data_path: Path, tokenizer, max_seq_len: int) -> Dataset:
@@ -156,39 +212,29 @@ def load_and_tokenize(data_path: Path, tokenizer, max_seq_len: int) -> Dataset:
     })
 
 
-def build_model(model_dir: str, quantization: str, vocab_size: int):
-    """Load the base model in the requested quantization mode and prep for LoRA."""
-    if quantization == "qlora":
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",
-            bnb_4bit_compute_dtype=torch.bfloat16,
-            bnb_4bit_use_double_quant=True,
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir,
-            local_files_only=True,
-            quantization_config=bnb_config,
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
-        )
-        model.resize_token_embeddings(vocab_size)
-        model = prepare_model_for_kbit_training(model)
-        optim = "paged_adamw_8bit"
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_dir,
-            local_files_only=True,
-            device_map="auto",
-            torch_dtype=torch.bfloat16,
-        )
-        model.resize_token_embeddings(vocab_size)
-        model.gradient_checkpointing_enable()
-        model.enable_input_require_grads()
-        optim = "adamw_torch"
+def build_model(model_dir: str, vocab_size: int, use_deepspeed: bool):
+    """Load the base model in bf16 and prep for LoRA.
 
-    logging.info("Base model loaded (%s). Parameters: %s", quantization, f"{model.num_parameters():,}")
-    return model, optim
+    Under DeepSpeed ZeRO-3, device placement is owned by DS and `device_map="auto"`
+    conflicts with sharding, so we drop it. Gradient checkpointing is handled by
+    TrainingArguments(gradient_checkpointing=True) in that path too.
+    """
+    from_pretrained_kwargs = dict(
+        local_files_only=True,
+        dtype="auto",  # honor the MXFP4-native dtype on disk; don't upcast on load
+    )
+    if not use_deepspeed:
+        from_pretrained_kwargs["device_map"] = "auto"
+
+    model = AutoModelForCausalLM.from_pretrained(model_dir, **from_pretrained_kwargs)
+    model.resize_token_embeddings(vocab_size)
+
+    if not use_deepspeed:
+        model.gradient_checkpointing_enable()
+    model.enable_input_require_grads()
+
+    logging.info("Base model loaded. Parameters: %s", f"{model.num_parameters():,}")
+    return model
 
 
 def main() -> None:
@@ -202,6 +248,8 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    ds_config = resolve_deepspeed(args.deepspeed)
+
     logging.info("Run config: %s", vars(args))
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True)
@@ -212,6 +260,11 @@ def main() -> None:
 
     dataset = load_and_tokenize(data_file, tokenizer, MAX_SEQ_LEN)
     logging.info("Dataset: %d examples, padded to %d tokens", len(dataset), MAX_SEQ_LEN)
+
+    if args.max_samples is not None:
+        n = min(args.max_samples, len(dataset))
+        dataset = dataset.select(range(n))
+        logging.info("Smoke-test mode: trimmed dataset to %d examples", n)
 
     first = dataset[0]
     mask_boundary = next(i for i, l in enumerate(first["labels"]) if l != -100)
@@ -226,7 +279,7 @@ def main() -> None:
         sum(first["attention_mask"]),
     )
 
-    model, optim = build_model(args.model_dir, args.quantization, len(tokenizer))
+    model = build_model(args.model_dir, len(tokenizer), use_deepspeed=ds_config is not None)
 
     lora_config = LoraConfig(
         r=LORA_R,
@@ -252,12 +305,13 @@ def main() -> None:
         logging_steps=LOGGING_STEPS,
         logging_dir=str(output_dir / "runs"),
         save_strategy="epoch",
-        optim=optim,
+        optim="adamw_torch",
         gradient_checkpointing=True,
         max_grad_norm=1.0,
         report_to="tensorboard",
         remove_unused_columns=False,
         dataloader_pin_memory=False,
+        deepspeed=ds_config,
     )
 
     trainer = Trainer(model=model, args=training_args, train_dataset=dataset)
@@ -268,16 +322,19 @@ def main() -> None:
     elapsed = time.perf_counter() - t0
     logging.info("Training finished in %.1fs (%.2f min)", elapsed, elapsed / 60.0)
 
-    log_path = output_dir / "training_log.json"
-    with open(log_path, "w", encoding="utf-8") as f:
-        json.dump(trainer.state.log_history, f, indent=2)
-    logging.info("Wrote step-level log history to %s", log_path)
-
+    # Trainer.save_model is ZeRO-3- and PEFT-aware: it triggers the param gather
+    # (via stage3_gather_16bit_weights_on_model_save) and writes only on rank 0,
+    # so we don't get one full copy per GPU like the old model.save_pretrained did.
     adapter_path = output_dir / "final_adapter"
-    adapter_path.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(str(adapter_path))
-    tokenizer.save_pretrained(str(adapter_path))
-    logging.info("Adapter + tokenizer saved to %s", adapter_path)
+    trainer.save_model(str(adapter_path))
+
+    if trainer.is_world_process_zero():
+        tokenizer.save_pretrained(str(adapter_path))
+        log_path = output_dir / "training_log.json"
+        with open(log_path, "w", encoding="utf-8") as f:
+            json.dump(trainer.state.log_history, f, indent=2)
+        logging.info("Adapter + tokenizer saved to %s", adapter_path)
+        logging.info("Wrote step-level log history to %s", log_path)
 
 
 if __name__ == "__main__":
