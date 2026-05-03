@@ -102,7 +102,10 @@ def build_zero3_config() -> dict:
         "bf16": {"enabled": True},
         "zero_optimization": {
             "stage": 3,
-            "offload_param":     {"device": "cpu", "pin_memory": True},
+            # `offload_param` removed — keeping the partitioned base weights on GPU is
+            # faster, and on 8x80GB the per-rank partition (~11GB of 90GB total) fits.
+            # `offload_optimizer` kept: harmless because LoRA optimizer state is tiny,
+            # and it leaves a bit more GPU room for activations.
             "offload_optimizer": {"device": "cpu", "pin_memory": True},
             "overlap_comm": True,
             "contiguous_gradients": True,
