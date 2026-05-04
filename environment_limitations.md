@@ -62,55 +62,7 @@ This is the same class of incompatibility as QLoRA + ZeRO-3: a runtime quantizer
 
 ## Required vs. current environment
 
-| Component | Required for packed MXFP4 + ZeRO-3 | Current |
-|---|---|---|
-| GPU architecture | Hopper or newer (H100 / H200 / MI300X) | _to confirm via `nvidia-smi`_ |
-| `torch` | >= 2.7 (bundles triton 3.3+) | **2.6.0** |
-| `triton` | >= 3.4 | **3.2.0** |
-| `transformers` | >= 4.55 (with gpt-oss MXFP4 quantizer) | OK |
-| `kernels` | latest (>= 0.13.x) | not installed |
-
-`torch 2.6.0` ships with `triton 3.2.0` — both are below the floor. Upgrading `kernels` alone does not help: old triton cannot compile the MXFP4 ops, and no software upgrade rescues an A100 because MXFP4 needs FP4 silicon that A100 lacks.
-
-## Paths forward
-
-### A. If the cluster has Hopper-class GPUs (H100 / H200 / MI300X)
-
-Upgrade the environment. Easiest is a fresh conda env following the gpt-oss install:
-
-```bash
-pip install -U torch transformers kernels
-```
-
-This pulls `torch 2.7+` (which brings `triton 3.4+`) and the `kernels` package. With that combination:
-
-- MXFP4 stays packed at ~60 GB
-- ZeRO-3 partitions to ~7.5 GB/rank across 8 GPUs
-- The existing `02_sft_training.py` should run without further changes
-
-### B. If the cluster is A100 (or any non-Hopper GPU)
-
-Packed MXFP4 is not available on this hardware regardless of software. The pragmatic path is to dequantize the checkpoint to bf16 **once** and train against the bf16 copy, which DeepSpeed ZeRO-3 partitions normally.
-
-```python
-from transformers import AutoModelForCausalLM, AutoTokenizer
-
-m = AutoModelForCausalLM.from_pretrained(
-    "openai/gpt-oss-120b",
-    torch_dtype="bfloat16",
-    device_map="cpu",
-    quantization_config={"dequantize": True},
-)
-m.save_pretrained("/path/to/gpt-oss-120b-bf16", safe_serialization=True)
-AutoTokenizer.from_pretrained("openai/gpt-oss-120b").save_pretrained(
-    "/path/to/gpt-oss-120b-bf16"
-)
-```
-
-The bf16 copy will be ~240 GB on disk. ZeRO-3 partitions it to ~30 GB/rank on 8x80 GB, which fits comfortably alongside activations and LoRA state. After dequant, point `--model-dir` at the bf16 directory and run the existing script — no other changes needed.
-
-Run the dequant on a machine with at least ~256 GB of CPU RAM (or stream shard-by-shard on a smaller box).
-
-## Open question
-
-`nvidia-smi --query-gpu=name --format=csv,noheader` is the deciding factor — it tells us whether path A or path B applies. The 79.10 GiB capacity reported in the OOM is consistent with both A100-80GB and H100-80GB, so the symptom alone is not diagnostic.
+| Component  | Required for packed MXFP4 + ZeRO-3 | Current         |
+| ---------- | ---------------------------------- | --------------- |
+| `triton` | >= 3.4                             | 3.2.0           |
+| `torch`  | >= 2.7 (bundles triton 3.3+)       | **2.6.0** |
