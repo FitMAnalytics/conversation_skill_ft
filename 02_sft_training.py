@@ -17,18 +17,31 @@ Per-token weighted loss replaces the simple -100 mask:
 Loss = sum(weights * per_token_ce) / sum(weights), per example, then mean across batch.
 
 Launch:
-    # Single-GPU LoRA smoke test:
+    # Single-GPU LoRA smoke test (no launcher needed):
     python 02_sft_training.py --input data/preprocessed.jsonl --max-samples 20 --epochs 1
 
-    # 8-GPU ZeRO-3 production run for GPT-OSS-120B:
-    deepspeed --num_gpus=8 02_sft_training.py --input data/preprocessed.jsonl \\
-        --deepspeed zero3 --epochs 3
+    # Multi-GPU production run via `accelerate launch` (FSDP or DeepSpeed-ZeRO-3,
+    # selected by the accelerate config file). Per cluster policy this is the
+    # only supported multi-GPU launcher — do NOT call `deepspeed` directly.
+    accelerate launch --config_file <accelerate_config.yaml> 02_sft_training.py \\
+        --input data/preprocessed.jsonl --epochs 3
+    # Or override the config's distributed type at the CLI:
+    accelerate launch --config_file <accelerate_config.yaml> --use_fsdp \\
+        02_sft_training.py --input data/preprocessed.jsonl --epochs 3
+
+The script does not configure DeepSpeed/FSDP itself — Trainer auto-picks up the
+accelerate plugin from the launch environment. For DeepSpeed-ZeRO-3 specifically
+the accelerate config should set `zero3_init_flag: true` so parameters are
+partitioned at `from_pretrained` time (equivalent to the old HfDeepSpeedConfig
+hook); without that flag every rank tries to materialize the full model on
+cuda:0 and OOMs.
 """
 
 import argparse
 import importlib.util
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -84,8 +97,6 @@ def parse_args() -> argparse.Namespace:
                    help="Per-token weight on analysis-channel content tokens")
     p.add_argument("--final-weight", type=float, default=1.0,
                    help="Per-token weight on final-channel content + assistant framing tokens")
-    p.add_argument("--deepspeed", default=None,
-                   help="'zero3' for the built-in preset, or path to custom JSON. Omit for single-GPU.")
     p.add_argument("--max-samples", type=int, default=None,
                    help="Smoke test: train on first N substantial examples")
     p.add_argument("--max-seq-len", type=int, default=MAX_SEQ_LEN)
@@ -94,42 +105,22 @@ def parse_args() -> argparse.Namespace:
                         "Token-budget truncation (drops oldest turns until prefix+suffix fits "
                         "within --max-seq-len) runs after windowing — system prompt and context "
                         "are never truncated.")
-    # Absorb deepspeed launcher flag.
+    # Absorb the local-rank flag forwarded by accelerate / torchrun.
     p.add_argument("--local_rank", type=int, default=-1, help=argparse.SUPPRESS)
     return p.parse_args()
 
 
-def build_zero3_config() -> dict:
-    return {
-        "bf16": {"enabled": True},
-        "zero_optimization": {
-            "stage": 3,
-            "offload_optimizer": {"device": "cpu", "pin_memory": True},
-            "overlap_comm": True,
-            "contiguous_gradients": True,
-            "reduce_bucket_size": "auto",
-            "stage3_prefetch_bucket_size": "auto",
-            "stage3_param_persistence_threshold": "auto",
-            "stage3_max_live_parameters": 1e9,
-            "stage3_max_reuse_distance": 1e9,
-            "stage3_gather_16bit_weights_on_model_save": True,
-        },
-        "gradient_accumulation_steps": "auto",
-        "gradient_clipping": "auto",
-        "train_micro_batch_size_per_gpu": "auto",
-        "train_batch_size": "auto",
-    }
+def is_distributed_launch() -> bool:
+    """True when launched under `accelerate launch` (FSDP or DeepSpeed) or `torchrun`.
 
-
-def resolve_deepspeed(arg: str | None):
-    if arg is None:
-        return None
-    if arg == "zero3":
-        return build_zero3_config()
-    cfg_path = Path(arg)
-    if not cfg_path.is_file():
-        raise FileNotFoundError(f"DeepSpeed config not found: {cfg_path}")
-    return str(cfg_path)
+    Checked via env vars set by the launcher: LOCAL_RANK is set by torchrun and by
+    accelerate in any multi-process config; the ACCELERATE_USE_* flags catch the
+    single-process accelerate case where we still want to skip device_map.
+    """
+    if "LOCAL_RANK" in os.environ:
+        return True
+    return any(os.environ.get(k, "").lower() == "true"
+               for k in ("ACCELERATE_USE_FSDP", "ACCELERATE_USE_DEEPSPEED"))
 
 
 def render_prefix(tokenizer, transcript: str, history_summary: str, context: str = "") -> str:
@@ -327,12 +318,20 @@ class WeightedLossTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
 
-def build_model(model_dir: str, use_deepspeed: bool):
+def build_model(model_dir: str, distributed: bool):
+    """Load the base model.
+
+    Under a distributed launcher (accelerate FSDP or DeepSpeed-ZeRO-3) we must NOT
+    pass `device_map="auto"` — it conflicts with FSDP wrapping and bypasses
+    `deepspeed.zero.Init` partitioning. The Trainer/Accelerate stack handles
+    placement and gradient checkpointing in that case via the accelerate config
+    plus the `gradient_checkpointing=True` TrainingArgument.
+    """
     kwargs = dict(local_files_only=True, dtype="auto")
-    if not use_deepspeed:
+    if not distributed:
         kwargs["device_map"] = "auto"
     model = AutoModelForCausalLM.from_pretrained(model_dir, **kwargs)
-    if not use_deepspeed:
+    if not distributed:
         model.gradient_checkpointing_enable()
     model.enable_input_require_grads()
     logging.info("Base model loaded. Parameters: %s", f"{model.num_parameters():,}")
@@ -345,13 +344,10 @@ def main() -> None:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    ds_config = resolve_deepspeed(args.deepspeed)
-
-    if ds_config is not None:
-        from transformers.integrations import HfDeepSpeedConfig
-        _dschf = HfDeepSpeedConfig(ds_config)  # noqa: F841 — must stay alive
+    distributed = is_distributed_launch()
 
     logging.info("Run config: %s", vars(args))
+    logging.info("Distributed launcher detected: %s", distributed)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir, local_files_only=True)
     if tokenizer.pad_token is None:
@@ -390,7 +386,7 @@ def main() -> None:
         float(w.sum()),
     )
 
-    model = build_model(args.model_dir, use_deepspeed=ds_config is not None)
+    model = build_model(args.model_dir, distributed=distributed)
     lora_config = LoraConfig(
         r=LORA_R,
         lora_alpha=LORA_ALPHA,
@@ -421,7 +417,6 @@ def main() -> None:
         report_to="tensorboard",
         remove_unused_columns=False,
         dataloader_pin_memory=False,
-        deepspeed=ds_config,
     )
 
     trainer = WeightedLossTrainer(model=model, args=training_args, train_dataset=dataset)

@@ -6,11 +6,11 @@ The current environment (`torch 2.6.0` / `triton 3.2.0`) is **below the floor** 
 
 ## What we tried
 
-Running `02_sft_training.py` with `deepspeed --num_gpus=8 ... --deepspeed zero3` on the cluster. The script was already configured with:
+Running `02_sft_training.py` via the now-mandated `accelerate launch --config_file <ds_zero3.yaml> 02_sft_training.py` (the accelerate config carries `deepspeed_config` with stage 3, `zero3_init_flag: true`, and cpu optimizer offload). Earlier attempts with the direct `deepspeed --num_gpus=8 ... --deepspeed zero3` invocation hit the same wall — the failure mode is launcher-agnostic. With either launcher the script ran with:
 
 - `dtype="auto"` so the MXFP4 weights would be honored on disk
-- `HfDeepSpeedConfig` instantiated before `from_pretrained` (so `deepspeed.zero.Init` would partition tensors during construction)
-- `device_map` removed under DeepSpeed (it conflicts with ZeRO-3 sharding)
+- `zero3_init_flag: true` in the accelerate config (formerly `HfDeepSpeedConfig`) so `deepspeed.zero.Init` partitions tensors during construction
+- `device_map` skipped under any distributed launcher (it conflicts with ZeRO-3 sharding and with FSDP wrapping)
 - `stage3_gather_16bit_weights_on_model_save: true` for the save path
 - `offload_optimizer: cpu` retained, `offload_param` removed
 

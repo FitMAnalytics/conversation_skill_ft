@@ -13,6 +13,11 @@ Launch:
     python 03_inference.py --input data/test.jsonl --output data/inference.jsonl \\
         --model-dir /path/to/gpt-oss-120b --adapter-dir checkpoints/final_adapter \\
         --reasoning-effort medium
+
+Inference runs single-process with `device_map="auto"` for tensor-parallel
+sharding across local GPUs — do NOT invoke this script via `accelerate launch`
+or `deepspeed`. (Training uses `accelerate launch` per cluster policy; inference
+does not, since FSDP/ZeRO-3 sharding is for backward passes that don't run here.)
 """
 
 import argparse
