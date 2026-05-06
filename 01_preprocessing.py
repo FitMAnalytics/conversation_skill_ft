@@ -19,7 +19,6 @@ import hashlib
 import json
 import logging
 import re
-import sys
 import time
 from pathlib import Path
 
@@ -143,10 +142,19 @@ def load_processed_hashes(output_path: Path) -> set[str]:
 
 
 def load_model(model_dir: str):
+    """Load tokenizer + model with the inspection-notebook's working recipe.
+
+    `torch_dtype=torch.bfloat16` (not `dtype="auto"`): on torch 2.6 / triton 3.2
+    the MXFP4 quantizer can't keep weights packed and dequantizes every expert
+    to bf16 at load time (~240 GB). With `dtype="auto"` the dequant intermediates
+    land on cuda:0 before `device_map="auto"` dispatches the modules, OOMing the
+    first GPU. Forcing `torch_dtype=torch.bfloat16` routes those tensors through
+    device_map and shards the load across visible GPUs.
+    """
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
     model = AutoModelForCausalLM.from_pretrained(
         model_dir,
-        dtype="auto",
+        torch_dtype=torch.bfloat16,
         device_map="auto",
         local_files_only=True,
         low_cpu_mem_usage=True,
