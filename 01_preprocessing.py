@@ -125,23 +125,34 @@ def run_and_show(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    kwargs = dict(add_generation_prompt=True, return_tensors="pt")
+    # gpt-oss's chat template returns a BatchEncoding (dict-like) — request it
+    # explicitly with return_dict=True and splat into generate so attention_mask
+    # is passed through. Older templates may not accept return_dict; fall back.
+    kwargs = dict(add_generation_prompt=True, return_tensors="pt", return_dict=True)
     try:
-        input_ids = tokenizer.apply_chat_template(
+        inputs = tokenizer.apply_chat_template(
             messages, reasoning_effort=reasoning_effort, **kwargs
         )
     except TypeError:
-        input_ids = tokenizer.apply_chat_template(messages, **kwargs)
-    input_ids = input_ids.to(model.device)
+        try:
+            inputs = tokenizer.apply_chat_template(messages, **kwargs)
+        except TypeError:
+            kwargs.pop("return_dict")
+            ids = tokenizer.apply_chat_template(messages, **kwargs)
+            inputs = {"input_ids": ids}
+    if not isinstance(inputs, dict):  # bare tensor fallback
+        inputs = {"input_ids": inputs}
+    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+    input_len = inputs["input_ids"].shape[1]
 
     with torch.no_grad():
         out = model.generate(
-            input_ids,
+            **inputs,
             max_new_tokens=max_new_tokens,
             do_sample=False,
             pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
         )
-    raw = tokenizer.decode(out[0, input_ids.shape[1]:], skip_special_tokens=False)
+    raw = tokenizer.decode(out[0, input_len:], skip_special_tokens=False)
     analysis, final = _split_channels(raw)
 
     if verbose:
