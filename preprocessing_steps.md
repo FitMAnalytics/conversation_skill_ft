@@ -110,12 +110,17 @@ notebook imports from it via `importlib`):
   - `run_and_show` — single-prompt inference with harmony channel splitting
   - `get_customer_context`, `get_product_context` — easy-to-edit context blocks
   - 5 stage prompt constants + per-row functions + per-stage batch runners
-  - CLI: `--input/--output/--stages/--limit/--cuda-visible/--auto-save-batch-size`
+  - CLI: `--input/--output/--stages/--limit/--cuda-visible/--auto-save-batch-size/--batch-size`
   - **Auto-save + auto-resume.** Each stage saves the parquet every
     `--auto-save-batch-size` rows (default 50). On startup, if the output
     parquet already exists, it's loaded and resumed from. Per-row resume
     granularity via `_stage{N}_done` boolean tracker columns — interrupt
     mid-stage and the next run picks up exactly where it stopped.
+  - **Batched inference.** Stages 1, 2, 3 run generation in batches of
+    `--batch-size` (default 4) for throughput. Stages 4 (cached) and 5
+    (long, variable-length outputs) stay singleton. From the notebook the
+    runners default to singleton (`batch_size=1`) so cell behavior is
+    unchanged.
 - **`01_preprocessing.ipynb`**
   - Cell-per-stage inspection on a single picked row, both channels printed
   - Side-by-side: does the CoT (final channel) land at `polished_response`?

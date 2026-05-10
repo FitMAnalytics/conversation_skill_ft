@@ -35,6 +35,10 @@ runner tracks per-row completion in a `_stage{N}_done` boolean column and
 skips rows that are already done. Killing the script mid-stage and
 restarting picks up where it left off.
 
+Batched inference: stages 1, 2, 3 run generation in batches of
+--batch-size (default 4) for throughput. Stages 4 (per-customer cache) and
+5 (long outputs / variable length) stay singleton.
+
 Filter cascade: stages 3, 4, 5 only run on rows that survive both
 `keep_stage1=True` and `exclude_stage2=False`. Stage 2 only runs on rows with
 `keep_stage1=True`. Ineligible rows get empty/None values in the new columns
@@ -100,6 +104,11 @@ def load_teacher_model(model_dir: str = DEFAULT_MODEL_DIR):
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
     if tokenizer.padding_side != "left":
         tokenizer.padding_side = "left"
+    # Batch tokenization requires a real pad_token. gpt-oss tokenizers may
+    # leave it as None; fall back to eos_token so `tokenizer(prompts,
+    # padding=True, ...)` works.
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(
         model_dir,
         torch_dtype=torch.bfloat16,
@@ -179,6 +188,59 @@ def run_and_show(
         print(final or "(empty)")
         print("=" * 72)
     return {"analysis": analysis, "final": final, "raw": raw}
+
+
+def run_and_show_batch(
+    model,
+    tokenizer,
+    prompts: list,                  # list of (system_prompt, user_prompt) tuples
+    reasoning_effort: str = "medium",
+    max_new_tokens: int = 2048,
+) -> list:
+    """Batched single-shot inference. Returns a list of {analysis, final, raw}
+    dicts, one per input prompt.
+
+    Uses left-padding so prompts of different lengths align at the right edge
+    and `new_tokens = out[i, input_len:]` is correct for every row.
+    """
+    import torch
+    if not prompts:
+        return []
+
+    rendered = []
+    for sys_p, user_p in prompts:
+        messages = [
+            {"role": "system", "content": sys_p},
+            {"role": "user", "content": user_p},
+        ]
+        try:
+            rendered.append(tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+                reasoning_effort=reasoning_effort,
+            ))
+        except TypeError:
+            rendered.append(tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True,
+            ))
+
+    inputs = tokenizer(rendered, padding=True, return_tensors="pt").to(model.device)
+    input_len = inputs["input_ids"].shape[1]
+
+    with torch.no_grad():
+        out = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+        )
+
+    results = []
+    for i in range(len(rendered)):
+        new_tokens = out[i, input_len:]
+        raw = tokenizer.decode(new_tokens, skip_special_tokens=False)
+        analysis, final = _split_channels(raw)
+        results.append({"analysis": analysis, "final": final, "raw": raw})
+    return results
 
 
 def _parse_json_block(text: str) -> dict:
@@ -539,13 +601,26 @@ def _save_checkpoint(df, output_path: Path, *, stage_label: str = "",
         logging.debug("Auto-save -> %s (%d rows)", output_path, len(df))
 
 
-def _maybe_autosave(df, save_path: Path | None, save_every: int | None,
-                    processed: int, stage_label: str) -> None:
-    """Save the in-progress dataframe every `save_every` processed rows."""
-    if save_path is None or not save_every:
-        return
-    if processed > 0 and processed % save_every == 0:
-        _save_checkpoint(df, save_path, stage_label=stage_label, verbose=False)
+class _Autosaver:
+    """Periodic autosave bookkeeping. Saves whenever `processed - last_saved`
+    crosses `save_every`. Robust to batched processing (where `processed`
+    increments by batch_size, so the old `processed % save_every == 0` check
+    could miss the threshold).
+    """
+
+    def __init__(self, save_path, save_every, stage_label):
+        self.save_path = save_path
+        self.save_every = save_every
+        self.stage_label = stage_label
+        self.last_saved = 0
+
+    def maybe_save(self, df, processed: int) -> None:
+        if self.save_path is None or not self.save_every:
+            return
+        if processed - self.last_saved >= self.save_every:
+            _save_checkpoint(df, self.save_path,
+                             stage_label=self.stage_label, verbose=False)
+            self.last_saved = processed
 
 
 def _eligible_after_stage_1(df):
@@ -593,37 +668,63 @@ def _init_col(df, col: str, default):
 
 def run_stage_1(df, model, tokenizer, *,
                 save_path: Path | None = None,
-                save_every: int | None = None):
+                save_every: int | None = None,
+                batch_size: int = 1):
+    """Stage 1 with batched inference (short outputs — good batching candidate).
+
+    `batch_size=1` keeps singleton behavior (notebook default). CLI defaults to 4.
+    """
     df = df.copy()
     _init_col(df, "_stage1_done", False)
     _init_col(df, "keep_stage1", False)
     _init_col(df, "stage1_reason", "")
 
-    from tqdm import tqdm
     indices = df.index.tolist()
+    todo = [i for i in range(len(df)) if not bool(df.at[indices[i], "_stage1_done"])]
+
+    from tqdm import tqdm
+    saver = _Autosaver(save_path, save_every, "1")
     processed = 0
-    for i in tqdm(range(len(df)), desc="stage1-filter"):
-        idx = indices[i]
-        if bool(df.at[idx, "_stage1_done"]):
-            continue
-        row = df.iloc[i].to_dict()
-        try:
-            result = stage1_filter_one(row, model, tokenizer)
-            df.at[idx, "keep_stage1"] = bool(result["keep_stage1"])
-            df.at[idx, "stage1_reason"] = str(result.get("stage1_reason", ""))
-        except Exception as e:  # noqa: BLE001
-            logging.warning("stage1 row %d failed: %s", i, e)
-            df.at[idx, "keep_stage1"] = False
-            df.at[idx, "stage1_reason"] = f"_error: {e}"
-        df.at[idx, "_stage1_done"] = True
-        processed += 1
-        _maybe_autosave(df, save_path, save_every, processed, "1")
+    with tqdm(total=len(todo), desc="stage1-filter") as pbar:
+        for b_start in range(0, len(todo), batch_size):
+            batch_ix = todo[b_start:b_start + batch_size]
+            user_prompts = []
+            for i in batch_ix:
+                row = df.iloc[i].to_dict()
+                user_prompts.append(STAGE1_USER_TMPL.format(
+                    transcript=row["full_conversation_pii_rmv_till_obj"],
+                    response=row["agent_response_snippet"],
+                ))
+            try:
+                outputs = run_and_show_batch(
+                    model, tokenizer,
+                    [(STAGE1_SYSTEM, u) for u in user_prompts],
+                    reasoning_effort="low", max_new_tokens=256,
+                )
+            except Exception as e:  # noqa: BLE001
+                logging.warning("stage1 batch starting at row %d failed: %s", batch_ix[0], e)
+                outputs = [{"final": "", "analysis": "", "raw": ""} for _ in batch_ix]
+            for i, out in zip(batch_ix, outputs):
+                idx = indices[i]
+                try:
+                    parsed = _parse_json_block(out["final"])
+                    df.at[idx, "keep_stage1"] = bool(parsed["keep"])
+                    df.at[idx, "stage1_reason"] = str(parsed.get("reason", ""))
+                except Exception as e:  # noqa: BLE001
+                    logging.warning("stage1 row %d parse failed: %s", i, e)
+                    df.at[idx, "keep_stage1"] = False
+                    df.at[idx, "stage1_reason"] = f"_error: {e}"
+                df.at[idx, "_stage1_done"] = True
+                processed += 1
+                pbar.update(1)
+            saver.maybe_save(df, processed)
     return df
 
 
 def run_stage_2(df, model, tokenizer, *,
                 save_path: Path | None = None,
-                save_every: int | None = None):
+                save_every: int | None = None,
+                batch_size: int = 1):
     df = df.copy()
     _init_col(df, "_stage2_done", False)
     # Compute eligibility BEFORE initializing exclude_stage2 — otherwise the
@@ -636,66 +737,111 @@ def run_stage_2(df, model, tokenizer, *,
     _init_col(df, "exclude_stage2", True)
     _init_col(df, "exclude_reason", None)
 
-    from tqdm import tqdm
     indices = df.index.tolist()
-    processed = 0
-    for i in tqdm(range(len(df)), desc="stage2-polish"):
+    # Mark ineligible (not-yet-done) rows immediately, leaving defaults.
+    todo = []
+    for i in range(len(df)):
         idx = indices[i]
         if bool(df.at[idx, "_stage2_done"]):
             continue
         if not eligible[i]:
-            # ineligible: leave defaults (polished_response="", exclude_stage2=True)
             df.at[idx, "_stage2_done"] = True
             continue
-        row = df.iloc[i].to_dict()
-        try:
-            result = stage2_polish_one(row, model, tokenizer)
-            df.at[idx, "polished_response"] = str(result.get("polished_response", ""))
-            df.at[idx, "polish_operations"] = list(result.get("polish_operations", []) or [])
-            df.at[idx, "completeness"] = str(result.get("completeness", ""))
-            df.at[idx, "exclude_stage2"] = bool(result.get("exclude_stage2", False))
-            df.at[idx, "exclude_reason"] = result.get("exclude_reason")
-        except Exception as e:  # noqa: BLE001
-            logging.warning("stage2 row %d failed: %s", i, e)
-            df.at[idx, "polished_response"] = ""
-            df.at[idx, "polish_operations"] = []
-            df.at[idx, "completeness"] = ""
-            df.at[idx, "exclude_stage2"] = True
-            df.at[idx, "exclude_reason"] = f"_error: {e}"
-        df.at[idx, "_stage2_done"] = True
-        processed += 1
-        _maybe_autosave(df, save_path, save_every, processed, "2")
+        todo.append(i)
+
+    from tqdm import tqdm
+    saver = _Autosaver(save_path, save_every, "2")
+    processed = 0
+    with tqdm(total=len(todo), desc="stage2-polish") as pbar:
+        for b_start in range(0, len(todo), batch_size):
+            batch_ix = todo[b_start:b_start + batch_size]
+            user_prompts = []
+            for i in batch_ix:
+                row = df.iloc[i].to_dict()
+                user_prompts.append(STAGE2_USER_TMPL.format(
+                    transcript=row["full_conversation_pii_rmv_till_obj"],
+                    response=row["agent_response_snippet"],
+                ))
+            try:
+                outputs = run_and_show_batch(
+                    model, tokenizer,
+                    [(STAGE2_SYSTEM, u) for u in user_prompts],
+                    reasoning_effort="medium", max_new_tokens=1024,
+                )
+            except Exception as e:  # noqa: BLE001
+                logging.warning("stage2 batch starting at row %d failed: %s", batch_ix[0], e)
+                outputs = [{"final": "", "analysis": "", "raw": ""} for _ in batch_ix]
+            for i, out in zip(batch_ix, outputs):
+                idx = indices[i]
+                try:
+                    parsed = _parse_json_block(out["final"])
+                    df.at[idx, "polished_response"] = str(parsed.get("polished_response", ""))
+                    df.at[idx, "polish_operations"] = list(parsed.get("operations_applied", []) or [])
+                    df.at[idx, "completeness"] = str(parsed.get("completeness", ""))
+                    df.at[idx, "exclude_stage2"] = bool(parsed.get("exclude", False))
+                    df.at[idx, "exclude_reason"] = parsed.get("exclude_reason")
+                except Exception as e:  # noqa: BLE001
+                    logging.warning("stage2 row %d parse failed: %s", i, e)
+                    df.at[idx, "polished_response"] = ""
+                    df.at[idx, "polish_operations"] = []
+                    df.at[idx, "completeness"] = ""
+                    df.at[idx, "exclude_stage2"] = True
+                    df.at[idx, "exclude_reason"] = f"_error: {e}"
+                df.at[idx, "_stage2_done"] = True
+                processed += 1
+                pbar.update(1)
+            saver.maybe_save(df, processed)
     return df
 
 
 def run_stage_3(df, model, tokenizer, *,
                 save_path: Path | None = None,
-                save_every: int | None = None):
+                save_every: int | None = None,
+                batch_size: int = 1):
     df = df.copy()
     _init_col(df, "_stage3_done", False)
     _init_col(df, "current_call_summary", "")
 
-    from tqdm import tqdm
     eligible = _eligible_after_stage_2(df).tolist()
     indices = df.index.tolist()
-    processed = 0
-    for i in tqdm(range(len(df)), desc="stage3-current-summary"):
+    todo = []
+    for i in range(len(df)):
         idx = indices[i]
         if bool(df.at[idx, "_stage3_done"]):
             continue
         if not eligible[i]:
             df.at[idx, "_stage3_done"] = True
             continue
-        row = df.iloc[i].to_dict()
-        try:
-            s = stage3_current_summary_one(row, model, tokenizer)
-            df.at[idx, "current_call_summary"] = s or ""
-        except Exception as e:  # noqa: BLE001
-            logging.warning("stage3 row %d failed: %s", i, e)
-            df.at[idx, "current_call_summary"] = ""
-        df.at[idx, "_stage3_done"] = True
-        processed += 1
-        _maybe_autosave(df, save_path, save_every, processed, "3")
+        todo.append(i)
+
+    from tqdm import tqdm
+    saver = _Autosaver(save_path, save_every, "3")
+    processed = 0
+    with tqdm(total=len(todo), desc="stage3-current-summary") as pbar:
+        for b_start in range(0, len(todo), batch_size):
+            batch_ix = todo[b_start:b_start + batch_size]
+            user_prompts = []
+            for i in batch_ix:
+                row = df.iloc[i].to_dict()
+                user_prompts.append(STAGE3_USER_TMPL.format(
+                    transcript=row["full_conversation_pii_rmv_till_obj"]
+                ))
+            try:
+                outputs = run_and_show_batch(
+                    model, tokenizer,
+                    [(STAGE3_SYSTEM, u) for u in user_prompts],
+                    reasoning_effort="medium", max_new_tokens=512,
+                )
+            except Exception as e:  # noqa: BLE001
+                logging.warning("stage3 batch starting at row %d failed: %s", batch_ix[0], e)
+                outputs = [{"final": "", "analysis": "", "raw": ""} for _ in batch_ix]
+            for i, out in zip(batch_ix, outputs):
+                idx = indices[i]
+                df.at[idx, "current_call_summary"] = (out.get("final") or "").strip()
+                df.at[idx, "_stage3_done"] = True
+                processed += 1
+                pbar.update(1)
+            saver.maybe_save(df, processed)
     return df
 
 
@@ -719,6 +865,7 @@ def run_stage_4(df, model, tokenizer, *,
             if key and key not in cache:
                 cache[key] = df.at[indices[i], "previous_calls_summary"]
 
+    saver = _Autosaver(save_path, save_every, "4")
     processed = 0
     for i in tqdm(range(len(df)), desc="stage4-prev-summary"):
         idx = indices[i]
@@ -745,7 +892,7 @@ def run_stage_4(df, model, tokenizer, *,
         df.at[idx, "previous_calls_summary"] = s
         df.at[idx, "_stage4_done"] = True
         processed += 1
-        _maybe_autosave(df, save_path, save_every, processed, "4")
+        saver.maybe_save(df, processed)
     return df
 
 
@@ -765,6 +912,7 @@ def run_stage_5(df, model, tokenizer, *,
     from tqdm import tqdm
     eligible = _eligible_after_stage_2(df).tolist()
     indices = df.index.tolist()
+    saver = _Autosaver(save_path, save_every, "5")
     processed = 0
     for i in tqdm(range(len(df)), desc="stage5-teacher"):
         idx = indices[i]
@@ -784,7 +932,7 @@ def run_stage_5(df, model, tokenizer, *,
             df.at[idx, "teacher_thinking"] = ""
         df.at[idx, "_stage5_done"] = True
         processed += 1
-        _maybe_autosave(df, save_path, save_every, processed, "5")
+        saver.maybe_save(df, processed)
     return df
 
 
@@ -814,6 +962,11 @@ def parse_args() -> argparse.Namespace:
                    help="Save the parquet every N processed rows within each "
                         "stage (default: 50). Set to 0 to disable mid-stage saves "
                         "(stage-end checkpoints still happen).")
+    p.add_argument("--batch-size", type=int, default=4,
+                   help="Generation batch size for stages 1, 2, 3 (default: 4). "
+                        "Higher uses more VRAM per GPU but more throughput. "
+                        "Stages 4 (cached) and 5 (long outputs) always run "
+                        "singleton.")
     return p.parse_args()
 
 
@@ -861,8 +1014,11 @@ def main() -> None:
     for s in stages:
         logging.info("=== Stage %s ===", s)
         t_stage = time.perf_counter()
-        df = STAGE_RUNNERS[s](df, model, tokenizer,
-                              save_path=out_path, save_every=save_every)
+        # Stages 1-3 accept batch_size; 4 and 5 ignore it.
+        kwargs = dict(save_path=out_path, save_every=save_every)
+        if s in ("1", "2", "3"):
+            kwargs["batch_size"] = args.batch_size
+        df = STAGE_RUNNERS[s](df, model, tokenizer, **kwargs)
         logging.info("Stage %s done in %.1fs", s, time.perf_counter() - t_stage)
         _save_checkpoint(df, out_path, stage_label=s)
 
