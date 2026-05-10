@@ -125,24 +125,20 @@ def run_and_show(
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    # gpt-oss's chat template returns a BatchEncoding (dict-like) — request it
-    # explicitly with return_dict=True and splat into generate so attention_mask
-    # is passed through. Older templates may not accept return_dict; fall back.
-    kwargs = dict(add_generation_prompt=True, return_tensors="pt", return_dict=True)
+    # Two-step rendering: chat-template -> string, then tokenize. Avoids the
+    # version-dependent return shape of apply_chat_template(return_dict=True),
+    # which on some gpt-oss tokenizers nests dicts under input_ids and breaks
+    # downstream `.shape` access.
     try:
-        inputs = tokenizer.apply_chat_template(
-            messages, reasoning_effort=reasoning_effort, **kwargs
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+            reasoning_effort=reasoning_effort,
         )
     except TypeError:
-        try:
-            inputs = tokenizer.apply_chat_template(messages, **kwargs)
-        except TypeError:
-            kwargs.pop("return_dict")
-            ids = tokenizer.apply_chat_template(messages, **kwargs)
-            inputs = {"input_ids": ids}
-    if not isinstance(inputs, dict):  # bare tensor fallback
-        inputs = {"input_ids": inputs}
-    inputs = {k: v.to(model.device) for k, v in inputs.items()}
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+        )
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
     input_len = inputs["input_ids"].shape[1]
 
     with torch.no_grad():
