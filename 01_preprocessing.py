@@ -7,9 +7,16 @@ Stages
                                     completeness, exclude_stage2, exclude_reason
   3. Current-call summary           current_call_summary
   4. Previous-calls summary         previous_calls_summary  (cached per customer)
-  5. Teacher CoT + response         teacher_analysis, teacher_final, cot_grounded
-                                    (Framing B: rationalize Stage 2's polished
-                                    response; see 0510_stage5_design.md)
+  5. Teacher rationalization CoT    teacher_cot, teacher_thinking
+                                    teacher IS shown polished_response and writes
+                                    a forward-looking first-person CoT (in the
+                                    final channel) that reconstructs the agent's
+                                    reasoning and lands at the given response.
+                                    teacher_cot (final channel) is the student's
+                                    analysis-channel SFT target; teacher_thinking
+                                    (analysis channel) is OSS's free-form planning,
+                                    stored as diagnostic only. See
+                                    0510_stage5_design.md.
   + customer_context, product_context columns for downstream SFT.
 
 Importable as a library (notebook uses it) AND runnable as a CLI batch script.
@@ -391,58 +398,56 @@ def stage4_prev_summary_one(row: dict, model, tokenizer) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Stage 5: Teacher CoT + response (Framing B — rationalize Stage 2's polished
-# response). Design rationale and full prompt rationale: 0510_stage5_design.md.
+# Stage 5: Rationalization CoT. Teacher IS shown polished_response and writes
+# a forward-looking first-person CoT that reconstructs the agent's reasoning
+# and lands at the given response. CoT goes in the FINAL channel (becomes the
+# student's analysis-channel SFT target); the model's analysis channel is its
+# own free-form planning, stored as diagnostic only. SFT pair downstream is
+# (teacher_cot, polished_response) — coherent by construction (the teacher
+# was shown the response and asked to write a CoT that leads to it). See
+# 0510_stage5_design.md.
 # ---------------------------------------------------------------------------
 
 STAGE5_SYSTEM = """You are an expert outbound sales agent at American Express on the TSE
 (Tele Strategic Expansion) channel.
 
 """ + TSE_BACKGROUND + """
-You will be given the customer's profile, product/campaign context, prior call
-history, current call state, the current objection, and the transcript up to
-this point. You need to think about how to respond, then respond.
 
-In the analysis channel, reason as the agent — first person, present tense,
-the way you'd think silently between hearing the objection and choosing what
-to say. Reason in flowing natural prose: not bullets, not headers, not JSON,
-not enumerated steps. Ground your thinking in the specific inputs in front
-of you: what does this customer's industry and history tell you, what has
-already happened in this call, what is the objection actually signaling
-beneath its wording, what response options do you have, and which one best
-serves the relationship and the call objective.
+You will be given everything an agent has in front of them at the moment of an
+objection — the customer's profile, product/campaign context, prior-call
+history, current-call summary, the objection itself, and the transcript up to
+that point — PLUS the response the agent actually gave (a polished version of
+their actual words).
 
-Reason as much as the case warrants and no more. Simple cases warrant brief
-reasoning; complex cases warrant more. Do not pad. Do not restate the inputs.
-Do not enumerate steps mechanically. Do not second-guess yourself in circles;
-once you've weighed the options and chosen, move on.
+Your task is to RECONSTRUCT the agent's forward reasoning — the chain of
+thought a skilled agent would have run silently between hearing the objection
+and speaking their next turn, ending exactly at the given response. You are
+not deciding what to say; the agent already chose. Your job is to write the
+thinking that leads to that choice. Even if you personally would have picked
+a different move, do not propose alternatives — reconstruct the reasoning
+that explains THIS response.
 
-In the final channel, produce ONE natural agent turn — what you would actually
-say next, in the words you would speak. No script formatting, no headers,
-no bullets, no stage directions. The final-channel response should be the
-natural conclusion of the reasoning you just did."""
+The reconstructed CoT goes in the FINAL channel. It must:
+  - Be in first person, present tense ("the customer is pushing back on
+    price... given their industry, this likely reflects..."). It should
+    read as if the agent is thinking it BEFORE speaking, not as a retrospective
+    explanation. Do NOT reference the response as something already given;
+    write the reasoning that arrives at it.
+  - Flow as natural prose. No bullets, headers, JSON, or enumerated steps.
+  - Ground in the visible inputs: what does this customer's industry and
+    history suggest, what has already happened in this call, what is the
+    objection actually signaling beneath its wording, what move best serves
+    the relationship and the call objective.
+  - Land naturally at the given response — the reasoning should make the
+    response feel like the obvious next move, not a leap.
+  - Be as long as the case warrants and no more. Simple objections warrant
+    brief reasoning; complex multi-signal cases warrant more. Do not pad,
+    do not restate inputs, do not second-guess in circles.
 
-STAGE5_USER_TMPL = """CUSTOMER CONTEXT:
-{customer_context}
-
-PRODUCT / CAMPAIGN CONTEXT:
-{product_context}
-
-PREVIOUS RELATIONSHIP HISTORY:
-{previous_calls_summary}
-
-CURRENT CALL SO FAR:
-{current_call_summary}
-
-CURRENT OBJECTION:
-{objection_summary}
-
-FULL TRANSCRIPT UP TO THIS POINT:
-{transcript}
-
-Reason about how to handle this objection in the analysis channel, and
-produce the agent turn you would say next in the final channel.
-"""
+The ANALYSIS channel is yours. Use it however helps you plan a good CoT —
+draft, weigh framings, check that the reasoning lands at the actual response,
+whatever. It will not be used as a training target. Don't worry about its
+form."""
 
 STAGE5_USER_TMPL = """CUSTOMER CONTEXT:
 {customer_context}
@@ -462,43 +467,21 @@ CURRENT OBJECTION:
 FULL TRANSCRIPT UP TO THIS POINT:
 {transcript}
 
-THE AGENT'S RESPONSE:
+THE RESPONSE THE AGENT GAVE:
 {polished_agent_response}
 
-In the analysis channel, reason about why this response is a good move given
-the situation, working only from the visible inputs and being honest about any
-points where the response appears to draw on information beyond what you can see.
-End your analysis with a [grounded: high|medium|low] tag. In the final channel,
-output the agent's response exactly as given.
+Reconstruct the agent's forward reasoning that led to this exact response.
+The CoT goes in the final channel — first person, present tense, flowing
+prose, grounded in the visible inputs, landing at the given response.
+Use the analysis channel however helps you plan the CoT.
 """
-
-
-_GROUNDED_RE = re.compile(
-    r"\[grounded:\s*(high|medium|low)\b[^\]]*\]\s*$",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
-def _extract_grounded_tag(analysis: str) -> tuple[str, str]:
-    """Strip the trailing `[grounded: high|medium|low ...]` tag from the analysis.
-
-    Returns (analysis_without_tag, tag_value). tag_value is "" if not found.
-    The student trains on the stripped version (per 0510_stage5_design.md, v1
-    decision is to strip; the tag lives in its own column for diagnostics).
-    """
-    a = analysis.rstrip()
-    m = _GROUNDED_RE.search(a)
-    if not m:
-        return a, ""
-    cleaned = a[:m.start()].rstrip()
-    return cleaned, m.group(1).lower()
 
 
 def stage5_teacher_one(row: dict, model, tokenizer) -> dict:
     polished = row.get("polished_response", "")
     if not polished:
-        # Stage 2 must have run and produced a non-empty polished response.
-        # Eligibility mask should already exclude these, but guard anyway.
+        # Stage 5 needs the polished response as input. The eligibility mask
+        # should already exclude rows where Stage 2 didn't produce one.
         raise ValueError("stage 5 requires polished_response from stage 2")
     user = STAGE5_USER_TMPL.format(
         customer_context=row.get("customer_context", ""),
@@ -511,16 +494,13 @@ def stage5_teacher_one(row: dict, model, tokenizer) -> dict:
     )
     out = run_and_show(model, tokenizer, STAGE5_SYSTEM, user,
                        reasoning_effort="high", max_new_tokens=4096)
-    analysis_clean, grounded = _extract_grounded_tag(out["analysis"])
-    # Final channel should echo `polished`; log if it drifts so we can
-    # spot-check during inspection.
-    if out["final"].strip() != polished.strip():
-        logging.debug("stage5 final-channel drift from polished_response "
-                      "(len diff %d)", len(out["final"]) - len(polished))
     return {
-        "teacher_analysis": analysis_clean,
-        "teacher_final": out["final"],
-        "cot_grounded": grounded,
+        # CoT lives in the FINAL channel — this becomes the student's
+        # analysis-channel SFT target.
+        "teacher_cot": out["final"],
+        # Diagnostic: whatever OSS wrote in its analysis channel while
+        # planning the CoT. Not a training target.
+        "teacher_thinking": out["analysis"],
     }
 
 
@@ -535,7 +515,7 @@ STAGE_COLS = {
           "exclude_stage2", "exclude_reason"],
     "3": ["current_call_summary"],
     "4": ["previous_calls_summary"],
-    "5": ["teacher_analysis", "teacher_final", "cot_grounded"],
+    "5": ["teacher_cot", "teacher_thinking"],
 }
 
 
@@ -667,16 +647,12 @@ def run_stage_5(df, model, tokenizer):
     out = _apply_per_row(df, lambda r: stage5_teacher_one(r, model, tokenizer),
                          desc="stage5-teacher",
                          only_where=_eligibility_mask(df))
-    df["teacher_analysis"] = [
-        r.get("teacher_analysis", "") if r and "_error" not in r else ""
+    df["teacher_cot"] = [
+        r.get("teacher_cot", "") if r and "_error" not in r else ""
         for r in out
     ]
-    df["teacher_final"] = [
-        r.get("teacher_final", "") if r and "_error" not in r else ""
-        for r in out
-    ]
-    df["cot_grounded"] = [
-        r.get("cot_grounded", "") if r and "_error" not in r else ""
+    df["teacher_thinking"] = [
+        r.get("teacher_thinking", "") if r and "_error" not in r else ""
         for r in out
     ]
     return df

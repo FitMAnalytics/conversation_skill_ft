@@ -2,9 +2,11 @@
 
 High-level summary of the preprocessing pipeline. For prompt text and
 implementation details, see `0510_preprocessing_plan.md` and
-`01_preprocessing.py`. Stage 5 was redesigned after the initial plan —
-authoritative source for that stage is `0510_stage5_design.md`. For env
-quirks hit along the way, see `gpt_oss_gotchas.md`.
+`01_preprocessing.py`. Stage 5 went through multiple framings before settling
+on the current design — authoritative source is `0510_stage5_design.md`
+(current decision: **rationalization CoT in the final channel**, teacher IS
+shown `polished_response`). For env quirks hit along the way, see
+`gpt_oss_gotchas.md`.
 
 ## Goal
 
@@ -26,13 +28,19 @@ For each objection row, the student is conditioned on:
 
 Training targets (training only):
 
-- `analysis_channel  = teacher_analysis`   — Stage 5 CoT (Framing B rationale)
-- `final_channel     = polished_response`  — Stage 2 polished agent turn
+- `analysis_channel  = teacher_cot`         — Stage 5 rationalization CoT
+                                              (sourced from the teacher's
+                                              **final** channel — see Stage 5
+                                              section below for the inversion)
+- `final_channel     = polished_response`   — Stage 2 polished agent turn
 
-Diagnostic-only column (not a training target): `cot_grounded` ∈ {high, medium,
-low}, the teacher's self-reported confidence that its CoT is fully derivable
-from the visible inputs. Aggregated to surface info-asymmetry; see
-`0510_stage5_design.md`.
+So the SFT pair is `(teacher_cot, polished_response)`. Coherent by
+construction: the teacher was shown `polished_response` and asked to write a
+CoT that reasons its way to it.
+
+Other Stage 5 column: `teacher_thinking` (from the teacher's analysis channel)
+— OSS's free-form planning while writing the CoT. Stored as diagnostic only;
+not a training target.
 
 ## Pipeline
 
@@ -53,43 +61,44 @@ Raw parquet
   ├─ Stage 4  Previous-calls summary         (medium effort, cached per customer)
   │           150–300 word prose history of prior calls; skipped when none
   │
-  ├─ Stage 5  Teacher CoT (Framing B)        (high effort)
-  │           shown Stage 2's polished response → reconstruct WHY it's a good move.
-  │           analysis = student's CoT target; final = echo of polished response;
-  │           ends with [grounded: high|medium|low] tag → cot_grounded column.
+  ├─ Stage 5  Rationalization CoT            (high effort)
+  │           teacher sees polished_response → writes a forward-looking
+  │           first-person CoT in the FINAL channel that lands at it.
+  │           Analysis channel = OSS's own planning (diagnostic only).
+  │           teacher_cot → student's analysis-channel SFT target.
   │
   └─ Save preprocessed parquet
 ```
 
 Filter cascade (enforced in code via `_eligibility_mask`): Stages 3, 4, 5 only
-run on rows with `keep_stage1=True & exclude_stage2=False`. Stage 5b (CoT
-quality judge per the design doc) is still TODO. Final SFT-ready filter:
-`keep_stage1 & ~exclude_stage2 & cot_quality_passed_5b` (or just
-`keep_stage1 & ~exclude_stage2` until 5b is implemented).
+run on rows with `keep_stage1=True & exclude_stage2=False`. Stage 5b
+(CoT-quality judge) is still TODO. Final SFT-ready filter under v1:
+`keep_stage1 & ~exclude_stage2` (add 5b once implemented).
 
 ## Why each stage exists
 
 - **Stage 1** drops rows where the agent didn't actually engage (pure "yeah,
   uh-huh"). Cheap reasoning — it's a coarse keep/drop decision.
-- **Stage 2** is the source of truth for the student's `final_channel` target.
-  The raw `agent_response_snippet` is fragmented and full of disfluencies; we
-  need a clean single utterance without fabricating content.
+- **Stage 2** produces `polished_response`, a clean version of the human
+  agent's actual response. This is the student's `final_channel` training
+  target and an input to Stage 5.
 - **Stage 3** is the conversational state at the moment of objection — what
   led here. Distinct from `objection_summary`, which describes the objection
   itself, not the surrounding state. Runs before Stage 4 because Stage 5 reads
   it directly.
-- **Stage 4** gives the student long-horizon relationship memory the raw
-  transcript doesn't carry. Cached because many objection rows share a
-  customer (and therefore share `previous_calls`).
-- **Stage 5** produces the teacher's reasoning under **Framing B**
-  (rationalization). The teacher is shown the polished response and asked to
-  reconstruct the agent's judgment chain in flowing prose, ending with a
-  groundedness tag. Final channel echoes the polished response by construction,
-  so there's no consistency-check filter — instead, Stage 5b (TODO) does an
-  LLM-as-judge pass on CoT quality. Rationale: with our small corpus the human
-  agent has hidden context the teacher doesn't, so a pure-derivation framing
-  would systematically drop the most skilled examples. Full reasoning in
-  `0510_stage5_design.md`.
+- **Stage 4** gives the teacher (and student) long-horizon relationship
+  memory the raw transcript doesn't carry. Cached because many objection rows
+  share a customer (and therefore share `previous_calls`).
+- **Stage 5** is a rationalization step with an inverted channel mapping.
+  The teacher is given the polished response as input and writes a
+  forward-looking first-person CoT — the kind of reasoning the agent would
+  have done silently *before* speaking, ending exactly at the given response.
+  The CoT goes in the **final** channel (so it becomes the student's
+  analysis-channel SFT target). The teacher's analysis channel is its own
+  free-form planning (don't write the CoT here, plan how to write it).
+  Coherence of the (CoT, polished_response) training pair is by construction:
+  the teacher was shown the response and asked to reason its way to it.
+  See `0510_stage5_design.md` for the framing alternatives weighed.
 
 ## Code layout
 
@@ -105,9 +114,51 @@ notebook imports from it via `importlib`):
   - Resume-safe checkpoints between stages (atomic parquet replace)
 - **`01_preprocessing.ipynb`**
   - Cell-per-stage inspection on a single picked row, both channels printed
-  - Side-by-side comparison of `teacher_final` vs `polished_response`
-  - 10-row smoke test cell
+  - Side-by-side: does the CoT (final channel) land at `polished_response`?
+  - 10-row smoke test cell + per-row dump of every generated field
   - Inspection checklist before launching the full batch
+
+## Input schema (what your parquet needs)
+
+**Hard requirements** — script crashes without these:
+
+| Column | Used by |
+|---|---|
+| `full_conversation_pii_rmv_till_obj` | stages 1, 2, 3, 5 (transcript text) |
+| `agent_response_snippet` | stages 1, 2 (raw fragmented response) |
+
+**Used if present, otherwise gracefully falls back**:
+
+| Column | Used by | Fallback |
+|---|---|---|
+| `objection_summary` | stage 5 | empty string |
+| `previous_calls` | stage 4 | summary returned as `None` |
+| `customer_id` or `cust_id` | stage 4 cache key | hashes `previous_calls` |
+| `sic4_industry`, `rev_tier`, `emp_ct`, `tier` | `get_customer_context` | `"unknown"` |
+| `cw_opp_type`, `task_type`, `task_subtype` | `get_product_context` | `"unknown"` |
+
+Edit `get_customer_context` / `get_product_context` to plumb more fields into
+the prompts.
+
+## Output schema
+
+All input columns are preserved. Stages add:
+
+| Column | Source | Type | Notes |
+|---|---|---|---|
+| `customer_context` | helper | str | from `get_customer_context` |
+| `product_context` | helper | str | from `get_product_context` |
+| `keep_stage1` | Stage 1 | bool | filter verdict |
+| `stage1_reason` | Stage 1 | str | brief reason |
+| `polished_response` | Stage 2 | str | clean agent turn; `""` if filtered out. Student's `final_channel` SFT target. |
+| `polish_operations` | Stage 2 | list[str] | which polish ops applied |
+| `completeness` | Stage 2 | str | "complete" / "completed_from_context" / "incomplete" |
+| `exclude_stage2` | Stage 2 | bool | True if un-polishable |
+| `exclude_reason` | Stage 2 | str \| None | |
+| `current_call_summary` | Stage 3 | str | `""` if ineligible |
+| `previous_calls_summary` | Stage 4 | str \| None | `None` if no prior calls or ineligible |
+| `teacher_cot` | Stage 5 (final channel) | str | rationalization CoT — student's `analysis_channel` SFT target |
+| `teacher_thinking` | Stage 5 (analysis channel) | str | OSS's free-form planning while writing the CoT — **diagnostic only**, not a training target |
 
 ## Env constraints we designed around
 
@@ -140,21 +191,24 @@ analysis, final = split_channels(raw)
 This pattern matches the working `gpt_oss_inspection_notebook` and avoids
 two real bugs we hit (`KeyError: 'shape'` from `generate`; the same error
 from `inputs["input_ids"].shape` even with `return_dict=True`). All five
-stages call through the single `_generate` / `run_and_show` helper that
-implements this. Reuse it for Stage 02 (SFT data formatting) and Stage 03
-(inference) — see `gpt_oss_gotchas.md` entry #1 for the full rationale.
+stages call through the single `run_and_show` helper that implements this.
+Reuse for Stage 02 (SFT) and Stage 03 (inference) — see `gpt_oss_gotchas.md`
+entry #1 for the full rationale.
 
 ## Open items (deferred to inspection phase)
 
-1. **Stage 5b CoT quality judge.** Under Framing B, 5b is no longer a
-   consistency check — it's an LLM-as-judge pass on whether the analysis is
-   coherent, references specific inputs, and is honest about groundedness.
-   Rubric and rationale in `0510_stage5_design.md`.
-2. **`cot_grounded` distribution review.** Once we have a few hundred rows,
-   look at the high/medium/low split. A large `low` fraction signals critical
-   context fields (account notes, CRM data) are missing — informs v2 schema.
-3. Per-stage reasoning-effort tuning once we see real outputs.
-4. Whether to include more fields in `customer_context` / `product_context`.
-5. Whether to hard-filter `cs_great_id == 0` rows up front or post-hoc.
-6. Whether to keep the `[grounded: ...]` tag in the student's analysis-channel
-   target (currently stripped — student doesn't learn to emit it).
+1. **Stage 5b: CoT-quality judge.** Since the (CoT, polished_response) pair
+   is coherent by construction, 5b doesn't need a divergence filter. What it
+   should check:
+   - Is the CoT actually first-person, forward-looking, and natural prose?
+   - Does it reference specific elements of the visible inputs?
+   - Does it engage with the substance of the objection?
+   - Does it land at the polished response in a way that feels natural rather
+     than forced?
+
+   LLM-as-judge with a simple rubric; drop rows that fail multiple checks.
+2. Per-stage reasoning-effort tuning once we see real outputs.
+3. Whether to include more fields in `customer_context` / `product_context`.
+4. Whether to hard-filter `cs_great_id == 0` rows up front or post-hoc.
+5. Whether to keep `teacher_thinking` long-term, or drop once we've verified
+   CoT quality (it's only diagnostic).

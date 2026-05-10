@@ -5,6 +5,75 @@ how the teacher (GPT-OSS-120B) generates the chain-of-thought (CoT) and final
 response that become training targets for the student's analysis and final
 channels.
 
+## Status (current decision, supersedes older sections below)
+
+**v1 uses rationalization-CoT with an inverted channel mapping.** Distinct
+from both Framing A (teacher reasons fresh, generates its own response) and
+the original Framing B (rationalization with CoT in analysis channel and
+response echoed in final channel) discussed below.
+
+The contract:
+
+- **Stage 5 prompt:** teacher sees the full context (customer/product profile,
+  prior-call summary, current-call summary, objection, transcript) AND the
+  polished agent response that Stage 2 produced. The teacher is told to
+  reconstruct the agent's *forward* reasoning — the chain of thought a
+  skilled agent would have run silently *before* speaking, written in first
+  person, present tense, ending exactly at the given response. The teacher is
+  explicitly told NOT to propose alternative moves even if it thinks of a
+  better one — the agent already chose; the job is to write the reasoning
+  that leads there.
+- **Channel mapping (note the inversion):**
+  - **Final channel** → the CoT (`teacher_cot`). This is the student's
+    `analysis_channel` SFT target.
+  - **Analysis channel** → OSS's free-form planning (`teacher_thinking`).
+    Unconstrained — let the model draft, weigh framings, check that the CoT
+    lands at the response, whatever. Stored as diagnostic only, not a
+    training target.
+- **Training pair stored:** `(teacher_cot, polished_response)`. The student's
+  `analysis_channel` target is the teacher's rationalization CoT; the
+  `final_channel` target is `polished_response`.
+- **Coherence by construction:** because the teacher was shown
+  `polished_response` and asked to write a CoT that leads to it, the
+  (CoT, polished_response) pair is coherent — no divergence filter needed.
+  Stage 5b becomes a CoT-quality judge (is the CoT first-person, forward-
+  looking, grounded in inputs, landing naturally at the response?) rather
+  than a divergence filter.
+
+Why this and not the alternatives:
+
+- **vs. pure Framing A (teacher reasons fresh, no `polished_response`):**
+  rejected because the teacher's CoT might not lead to `polished_response`
+  on individual rows, making the (CoT, polished_response) pair incoherent.
+  Even with a 5b divergence filter, we'd lose the most skilled examples
+  systematically (the ones where the agent used hidden context the teacher
+  doesn't have).
+- **vs. original Framing B (CoT in analysis channel, echo response in final):**
+  the inverted mapping puts the *training-target content* in the final
+  channel where the model can use the analysis channel as scratch space to
+  plan it. With the original mapping, the analysis channel had to be the
+  training target while the final channel was a near-duplicate of the input,
+  wasting that channel's natural use as the model's working scratch.
+- **vs. teacher-generates-its-own-response:** rejected because we want the
+  student to be aligned with how the human agent actually handled
+  objections, not with a synthesized teacher response.
+
+Concrete differences from the original Framing B (sections below):
+
+- No `[grounded: ...]` tag, no `cot_grounded` column.
+- CoT lives in the **final** channel (not the analysis channel).
+- The final channel is NOT an echo of `polished_response`; it's the CoT.
+- The CoT is in *first-person forward-looking* form ("the customer is pushing
+  back on price... given their industry...") rather than third-person
+  retrospective explanation ("this response makes sense because...").
+- 5b is a CoT-quality judge, not a CoT/response consistency filter.
+
+The rest of this doc — the original Framing B decisions and the prompt that
+went with them — is retained as historical context for the alternatives
+considered. **Do not implement from the sections below as-is.**
+
+---
+
 ## Decisions made
 
 ### 1. CoT format: free-form natural language prose
