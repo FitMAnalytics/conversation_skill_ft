@@ -28,13 +28,20 @@ Batch usage:
         --stages 1,2,3,4,5 \
         --cuda-visible 0,1,2,3
 
-Resume-safe: re-running with the same --output skips stages whose output
-columns already exist in the on-disk parquet.
+Auto-save + auto-resume: each stage writes the parquet every
+--auto-save-batch-size rows (default 50). If the output parquet already
+exists at startup, it is loaded and resumed from automatically — each stage
+runner tracks per-row completion in a `_stage{N}_done` boolean column and
+skips rows that are already done. Killing the script mid-stage and
+restarting picks up where it left off.
 
 Filter cascade: stages 3, 4, 5 only run on rows that survive both
 `keep_stage1=True` and `exclude_stage2=False`. Stage 2 only runs on rows with
 `keep_stage1=True`. Ineligible rows get empty/None values in the new columns
 so the schema stays consistent across the parquet.
+
+Internal tracker columns (`_stage1_done` ... `_stage5_done`) live in the
+parquet so resume works; downstream consumers can ignore them.
 """
 
 import argparse
@@ -519,142 +526,265 @@ STAGE_COLS = {
 }
 
 
-def _save_checkpoint(df, output_path: Path, stage: str) -> None:
+def _save_checkpoint(df, output_path: Path, *, stage_label: str = "",
+                     verbose: bool = True) -> None:
+    """Atomically write df to parquet via a .tmp + os.replace dance."""
     tmp = output_path.with_suffix(output_path.suffix + ".tmp")
     df.to_parquet(tmp, index=False)
     os.replace(tmp, output_path)
-    logging.info("Checkpoint saved after stage %s -> %s (%d rows)",
-                 stage, output_path, len(df))
+    if verbose:
+        logging.info("Checkpoint saved after stage %s -> %s (%d rows)",
+                     stage_label, output_path, len(df))
+    else:
+        logging.debug("Auto-save -> %s (%d rows)", output_path, len(df))
 
 
-def _has_stage_output(df, stage: str) -> bool:
-    return all(c in df.columns for c in STAGE_COLS[stage])
+def _maybe_autosave(df, save_path: Path | None, save_every: int | None,
+                    processed: int, stage_label: str) -> None:
+    """Save the in-progress dataframe every `save_every` processed rows."""
+    if save_path is None or not save_every:
+        return
+    if processed > 0 and processed % save_every == 0:
+        _save_checkpoint(df, save_path, stage_label=stage_label, verbose=False)
 
 
-def _eligibility_mask(df):
-    """True for rows still eligible after stage-1 filter and stage-2 exclusion.
+def _eligible_after_stage_1(df):
+    """For Stage 2: row is eligible if it survived Stage 1 (`keep_stage1=True`).
 
-    Used by stages 3/4/5 to skip rows that won't survive into the SFT set —
-    no point spending teacher tokens on them. If `keep_stage1` /
-    `exclude_stage2` columns aren't present yet (e.g. user ran a later stage
-    standalone), defaults to True so we don't silently no-op.
+    Stage 2 must NOT use `exclude_stage2` in its eligibility check — that's
+    Stage 2's own output, and using it would short-circuit Stage 2 to a no-op
+    on resume (since `_init_col` defaults `exclude_stage2=True` for unprocessed
+    rows).
     """
     import pandas as pd
-    mask = pd.Series([True] * len(df), index=df.index)
-    if "keep_stage1" in df.columns:
-        mask = mask & df["keep_stage1"].fillna(False).astype(bool)
+    if "keep_stage1" not in df.columns:
+        return pd.Series([True] * len(df), index=df.index)
+    return df["keep_stage1"].fillna(False).astype(bool)
+
+
+def _eligible_after_stage_2(df):
+    """For Stages 3/4/5: row eligible if it survived both Stage 1 and Stage 2.
+
+    If `keep_stage1` / `exclude_stage2` aren't present yet (e.g. user ran a
+    later stage standalone), defaults to True so we don't silently no-op.
+    """
+    import pandas as pd
+    mask = _eligible_after_stage_1(df)
     if "exclude_stage2" in df.columns:
         mask = mask & ~df["exclude_stage2"].fillna(True).astype(bool)
     return mask
 
 
-def _apply_per_row(df, fn, *, desc: str, only_where=None):
-    """Apply fn(row_dict) to each row; returns list of result dicts (or None on error).
+# Back-compat alias — older code/tests may reference the old name.
+_eligibility_mask = _eligible_after_stage_2
 
-    `only_where` is an optional boolean Series; rows where False get None.
-    """
+
+def _init_col(df, col: str, default):
+    """Add `col` filled with `default` if not already present. Object dtype so
+    we can hold mixed/Optional values cleanly across parquet round-trips."""
+    import pandas as pd
+    if col not in df.columns:
+        df[col] = pd.Series([default] * len(df), dtype=object)
+
+
+# Each stage runner uses a `_stage{N}_done` boolean tracker so we can skip
+# already-processed rows on resume and on partial mid-stage saves. The tracker
+# columns live in the parquet alongside the real outputs.
+
+def run_stage_1(df, model, tokenizer, *,
+                save_path: Path | None = None,
+                save_every: int | None = None):
+    df = df.copy()
+    _init_col(df, "_stage1_done", False)
+    _init_col(df, "keep_stage1", False)
+    _init_col(df, "stage1_reason", "")
+
     from tqdm import tqdm
-    results = []
-    n_err = 0
-    iterator = tqdm(df.to_dict("records"), desc=desc, total=len(df))
-    for i, row in enumerate(iterator):
-        if only_where is not None and not bool(only_where.iloc[i]):
-            results.append(None)
+    indices = df.index.tolist()
+    processed = 0
+    for i in tqdm(range(len(df)), desc="stage1-filter"):
+        idx = indices[i]
+        if bool(df.at[idx, "_stage1_done"]):
             continue
+        row = df.iloc[i].to_dict()
         try:
-            results.append(fn(row))
-        except Exception as e:  # noqa: BLE001 — isolated per row
-            logging.warning("%s row %d failed: %s", desc, i, e)
-            results.append({"_error": str(e)})
-            n_err += 1
-    if n_err:
-        logging.warning("%s: %d rows errored", desc, n_err)
-    return results
-
-
-def run_stage_1(df, model, tokenizer):
-    out = _apply_per_row(df, lambda r: stage1_filter_one(r, model, tokenizer),
-                         desc="stage1-filter")
-    df = df.copy()
-    df["keep_stage1"] = [bool(r.get("keep_stage1")) if r and "_error" not in r else False
-                        for r in out]
-    df["stage1_reason"] = [r.get("stage1_reason", "") if r and "_error" not in r
-                           else r.get("_error", "") if r else ""
-                           for r in out]
+            result = stage1_filter_one(row, model, tokenizer)
+            df.at[idx, "keep_stage1"] = bool(result["keep_stage1"])
+            df.at[idx, "stage1_reason"] = str(result.get("stage1_reason", ""))
+        except Exception as e:  # noqa: BLE001
+            logging.warning("stage1 row %d failed: %s", i, e)
+            df.at[idx, "keep_stage1"] = False
+            df.at[idx, "stage1_reason"] = f"_error: {e}"
+        df.at[idx, "_stage1_done"] = True
+        processed += 1
+        _maybe_autosave(df, save_path, save_every, processed, "1")
     return df
 
 
-def run_stage_2(df, model, tokenizer):
-    out = _apply_per_row(df, lambda r: stage2_polish_one(r, model, tokenizer),
-                         desc="stage2-polish", only_where=_eligibility_mask(df))
+def run_stage_2(df, model, tokenizer, *,
+                save_path: Path | None = None,
+                save_every: int | None = None):
     df = df.copy()
-    def field(r, k, default):
-        if not r or "_error" in r:
-            return default
-        return r.get(k, default)
-    df["polished_response"] = [field(r, "polished_response", "") for r in out]
-    df["polish_operations"] = [field(r, "polish_operations", []) for r in out]
-    df["completeness"] = [field(r, "completeness", "") for r in out]
-    df["exclude_stage2"] = [bool(field(r, "exclude_stage2", True)) for r in out]
-    df["exclude_reason"] = [field(r, "exclude_reason", None) for r in out]
-    return df
+    _init_col(df, "_stage2_done", False)
+    # Compute eligibility BEFORE initializing exclude_stage2 — otherwise the
+    # init default contaminates the mask. Also use the stage-1-only check;
+    # exclude_stage2 is *our* output, not an input we should gate on.
+    eligible = _eligible_after_stage_1(df).tolist()
+    _init_col(df, "polished_response", "")
+    _init_col(df, "polish_operations", [])
+    _init_col(df, "completeness", "")
+    _init_col(df, "exclude_stage2", True)
+    _init_col(df, "exclude_reason", None)
 
-
-def run_stage_3(df, model, tokenizer):
-    out = _apply_per_row(df, lambda r: stage3_current_summary_one(r, model, tokenizer),
-                         desc="stage3-current-summary",
-                         only_where=_eligibility_mask(df))
-    df = df.copy()
-    df["current_call_summary"] = [s if isinstance(s, str) else "" for s in out]
-    return df
-
-
-def run_stage_4(df, model, tokenizer):
-    df = df.copy()
-    eligible = _eligibility_mask(df).tolist()
-    cache: dict[str, str | None] = {}
-    summaries: list[str | None] = []
     from tqdm import tqdm
-    records = df.to_dict("records")
-    for i, row in enumerate(tqdm(records, desc="stage4-prev-summary", total=len(df))):
-        if not eligible[i]:
-            summaries.append(None)
+    indices = df.index.tolist()
+    processed = 0
+    for i in tqdm(range(len(df)), desc="stage2-polish"):
+        idx = indices[i]
+        if bool(df.at[idx, "_stage2_done"]):
             continue
-        key = _customer_cache_key(row)
+        if not eligible[i]:
+            # ineligible: leave defaults (polished_response="", exclude_stage2=True)
+            df.at[idx, "_stage2_done"] = True
+            continue
+        row = df.iloc[i].to_dict()
+        try:
+            result = stage2_polish_one(row, model, tokenizer)
+            df.at[idx, "polished_response"] = str(result.get("polished_response", ""))
+            df.at[idx, "polish_operations"] = list(result.get("polish_operations", []) or [])
+            df.at[idx, "completeness"] = str(result.get("completeness", ""))
+            df.at[idx, "exclude_stage2"] = bool(result.get("exclude_stage2", False))
+            df.at[idx, "exclude_reason"] = result.get("exclude_reason")
+        except Exception as e:  # noqa: BLE001
+            logging.warning("stage2 row %d failed: %s", i, e)
+            df.at[idx, "polished_response"] = ""
+            df.at[idx, "polish_operations"] = []
+            df.at[idx, "completeness"] = ""
+            df.at[idx, "exclude_stage2"] = True
+            df.at[idx, "exclude_reason"] = f"_error: {e}"
+        df.at[idx, "_stage2_done"] = True
+        processed += 1
+        _maybe_autosave(df, save_path, save_every, processed, "2")
+    return df
+
+
+def run_stage_3(df, model, tokenizer, *,
+                save_path: Path | None = None,
+                save_every: int | None = None):
+    df = df.copy()
+    _init_col(df, "_stage3_done", False)
+    _init_col(df, "current_call_summary", "")
+
+    from tqdm import tqdm
+    eligible = _eligible_after_stage_2(df).tolist()
+    indices = df.index.tolist()
+    processed = 0
+    for i in tqdm(range(len(df)), desc="stage3-current-summary"):
+        idx = indices[i]
+        if bool(df.at[idx, "_stage3_done"]):
+            continue
+        if not eligible[i]:
+            df.at[idx, "_stage3_done"] = True
+            continue
+        row = df.iloc[i].to_dict()
+        try:
+            s = stage3_current_summary_one(row, model, tokenizer)
+            df.at[idx, "current_call_summary"] = s or ""
+        except Exception as e:  # noqa: BLE001
+            logging.warning("stage3 row %d failed: %s", i, e)
+            df.at[idx, "current_call_summary"] = ""
+        df.at[idx, "_stage3_done"] = True
+        processed += 1
+        _maybe_autosave(df, save_path, save_every, processed, "3")
+    return df
+
+
+def run_stage_4(df, model, tokenizer, *,
+                save_path: Path | None = None,
+                save_every: int | None = None):
+    df = df.copy()
+    _init_col(df, "_stage4_done", False)
+    _init_col(df, "previous_calls_summary", None)
+
+    from tqdm import tqdm
+    eligible = _eligible_after_stage_2(df).tolist()
+    indices = df.index.tolist()
+    records = df.to_dict("records")
+
+    # Pre-populate per-customer cache from rows already processed in a prior run.
+    cache: dict[str, str | None] = {}
+    for i in range(len(df)):
+        if bool(df.at[indices[i], "_stage4_done"]):
+            key = _customer_cache_key(records[i])
+            if key and key not in cache:
+                cache[key] = df.at[indices[i], "previous_calls_summary"]
+
+    processed = 0
+    for i in tqdm(range(len(df)), desc="stage4-prev-summary"):
+        idx = indices[i]
+        if bool(df.at[idx, "_stage4_done"]):
+            continue
+        if not eligible[i]:
+            df.at[idx, "_stage4_done"] = True
+            continue
+        key = _customer_cache_key(records[i])
         if key == "":
-            summaries.append(None)
+            df.at[idx, "_stage4_done"] = True
             continue
         if key in cache:
-            summaries.append(cache[key])
+            df.at[idx, "previous_calls_summary"] = cache[key]
+            df.at[idx, "_stage4_done"] = True
+            # Cache hits are free — don't count toward autosave cadence.
             continue
         try:
-            s = stage4_prev_summary_one(row, model, tokenizer)
+            s = stage4_prev_summary_one(records[i], model, tokenizer)
         except Exception as e:  # noqa: BLE001
             logging.warning("stage4 failed for key %s: %s", key, e)
             s = None
         cache[key] = s
-        summaries.append(s)
-    df["previous_calls_summary"] = summaries
+        df.at[idx, "previous_calls_summary"] = s
+        df.at[idx, "_stage4_done"] = True
+        processed += 1
+        _maybe_autosave(df, save_path, save_every, processed, "4")
     return df
 
 
-def run_stage_5(df, model, tokenizer):
+def run_stage_5(df, model, tokenizer, *,
+                save_path: Path | None = None,
+                save_every: int | None = None):
     df = df.copy()
-    # Ensure customer/product context cols exist (cheap to recompute).
-    df["customer_context"] = [get_customer_context(r) for r in df.to_dict("records")]
-    df["product_context"] = [get_product_context(r) for r in df.to_dict("records")]
+    _init_col(df, "_stage5_done", False)
+    _init_col(df, "teacher_cot", "")
+    _init_col(df, "teacher_thinking", "")
+    # Stage 5 reads customer/product context; ensure they exist.
+    if "customer_context" not in df.columns:
+        df["customer_context"] = [get_customer_context(r) for r in df.to_dict("records")]
+    if "product_context" not in df.columns:
+        df["product_context"] = [get_product_context(r) for r in df.to_dict("records")]
 
-    out = _apply_per_row(df, lambda r: stage5_teacher_one(r, model, tokenizer),
-                         desc="stage5-teacher",
-                         only_where=_eligibility_mask(df))
-    df["teacher_cot"] = [
-        r.get("teacher_cot", "") if r and "_error" not in r else ""
-        for r in out
-    ]
-    df["teacher_thinking"] = [
-        r.get("teacher_thinking", "") if r and "_error" not in r else ""
-        for r in out
-    ]
+    from tqdm import tqdm
+    eligible = _eligible_after_stage_2(df).tolist()
+    indices = df.index.tolist()
+    processed = 0
+    for i in tqdm(range(len(df)), desc="stage5-teacher"):
+        idx = indices[i]
+        if bool(df.at[idx, "_stage5_done"]):
+            continue
+        if not eligible[i]:
+            df.at[idx, "_stage5_done"] = True
+            continue
+        row = df.iloc[i].to_dict()
+        try:
+            result = stage5_teacher_one(row, model, tokenizer)
+            df.at[idx, "teacher_cot"] = str(result.get("teacher_cot", ""))
+            df.at[idx, "teacher_thinking"] = str(result.get("teacher_thinking", ""))
+        except Exception as e:  # noqa: BLE001
+            logging.warning("stage5 row %d failed: %s", i, e)
+            df.at[idx, "teacher_cot"] = ""
+            df.at[idx, "teacher_thinking"] = ""
+        df.at[idx, "_stage5_done"] = True
+        processed += 1
+        _maybe_autosave(df, save_path, save_every, processed, "5")
     return df
 
 
@@ -680,8 +810,10 @@ def parse_args() -> argparse.Namespace:
                    help="Process only first N rows (smoke testing)")
     p.add_argument("--cuda-visible", default=None,
                    help="Set CUDA_VISIBLE_DEVICES, e.g. '0,1,2,3'")
-    p.add_argument("--resume", action="store_true",
-                   help="Read existing --output and skip stages whose columns exist")
+    p.add_argument("--auto-save-batch-size", type=int, default=50,
+                   help="Save the parquet every N processed rows within each "
+                        "stage (default: 50). Set to 0 to disable mid-stage saves "
+                        "(stage-end checkpoints still happen).")
     return p.parse_args()
 
 
@@ -704,12 +836,16 @@ def main() -> None:
         if s not in STAGE_RUNNERS:
             raise SystemExit(f"unknown stage {s!r}; valid: {list(STAGE_RUNNERS)}")
 
-    if args.resume and out_path.exists():
+    # Auto-resume: if the output parquet already exists, pick up where the
+    # previous run left off. Each stage runner skips rows whose `_stage{N}_done`
+    # flag is True, so resume works at row granularity, not just stage
+    # granularity.
+    if out_path.exists():
         df = pd.read_parquet(out_path)
-        logging.info("Resuming from %s (%d rows)", out_path, len(df))
+        logging.info("Auto-resuming from %s (%d rows)", out_path, len(df))
     else:
         df = pd.read_parquet(in_path)
-        logging.info("Loaded %s (%d rows)", in_path, len(df))
+        logging.info("Loaded fresh from %s (%d rows)", in_path, len(df))
     if args.limit is not None:
         df = df.head(args.limit).copy()
 
@@ -720,19 +856,17 @@ def main() -> None:
     model, tokenizer = load_teacher_model(args.model_dir)
     logging.info("Teacher model loaded.")
 
+    save_every = args.auto_save_batch_size if args.auto_save_batch_size > 0 else None
     t0 = time.perf_counter()
     for s in stages:
-        if args.resume and _has_stage_output(df, s):
-            logging.info("Stage %s already present — skipping", s)
-            continue
         logging.info("=== Stage %s ===", s)
         t_stage = time.perf_counter()
-        df = STAGE_RUNNERS[s](df, model, tokenizer)
+        df = STAGE_RUNNERS[s](df, model, tokenizer,
+                              save_path=out_path, save_every=save_every)
         logging.info("Stage %s done in %.1fs", s, time.perf_counter() - t_stage)
-        _save_checkpoint(df, out_path, stage=s)
+        _save_checkpoint(df, out_path, stage_label=s)
 
-    df.to_parquet(out_path, index=False)
-    logging.info("All stages done in %.1fs. Wrote %s (%d rows)",
+    logging.info("All stages done in %.1fs. Final output at %s (%d rows)",
                  time.perf_counter() - t0, out_path, len(df))
 
 

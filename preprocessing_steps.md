@@ -110,8 +110,12 @@ notebook imports from it via `importlib`):
   - `run_and_show` — single-prompt inference with harmony channel splitting
   - `get_customer_context`, `get_product_context` — easy-to-edit context blocks
   - 5 stage prompt constants + per-row functions + per-stage batch runners
-  - CLI: `--input/--output/--stages/--limit/--cuda-visible/--resume`
-  - Resume-safe checkpoints between stages (atomic parquet replace)
+  - CLI: `--input/--output/--stages/--limit/--cuda-visible/--auto-save-batch-size`
+  - **Auto-save + auto-resume.** Each stage saves the parquet every
+    `--auto-save-batch-size` rows (default 50). On startup, if the output
+    parquet already exists, it's loaded and resumed from. Per-row resume
+    granularity via `_stage{N}_done` boolean tracker columns — interrupt
+    mid-stage and the next run picks up exactly where it stopped.
 - **`01_preprocessing.ipynb`**
   - Cell-per-stage inspection on a single picked row, both channels printed
   - Side-by-side: does the CoT (final channel) land at `polished_response`?
@@ -159,6 +163,7 @@ All input columns are preserved. Stages add:
 | `previous_calls_summary` | Stage 4 | str \| None | `None` if no prior calls or ineligible |
 | `teacher_cot` | Stage 5 (final channel) | str | rationalization CoT — student's `analysis_channel` SFT target |
 | `teacher_thinking` | Stage 5 (analysis channel) | str | OSS's free-form planning while writing the CoT — **diagnostic only**, not a training target |
+| `_stage1_done` … `_stage5_done` | all stages | bool | per-row resume trackers. Internal; downstream consumers can ignore. |
 
 ## Env constraints we designed around
 
