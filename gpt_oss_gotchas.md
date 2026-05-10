@@ -10,24 +10,33 @@ papercuts.
 
 ## 1. `KeyError: 'shape'` from `model.generate` (and from `inputs['input_ids'].shape`)
 
-**Symptom.** Calling `model.generate(input_ids, max_new_tokens=...)` raises
-`KeyError: 'shape'` deep inside transformers. After "fixing" by switching to
-`apply_chat_template(..., return_dict=True)` and splatting with `**inputs`,
-the same `KeyError: 'shape'` reappears at `inputs["input_ids"].shape[1]` —
-because `inputs["input_ids"]` is itself a dict, not a tensor.
+> **Use render-then-tokenize for any gpt-oss inference call.** This is the
+> known-good pattern matching `gpt_oss_inspection_notebook` — verified working
+> in this environment. Don't let `apply_chat_template` tokenize for you.
 
-**Cause.** `apply_chat_template`'s return shape is version- and
-template-dependent:
-- With `return_tensors="pt"` alone, gpt-oss's chat template returns a
-  `BatchEncoding` (dict-like), not a tensor. Passing it positionally as
-  `input_ids` makes `generate` try `inputs['shape']` and crash.
+**Symptom.** One of two errors, depending on what you tried:
+- `model.generate(input_ids, ...)` raises `KeyError: 'shape'` deep inside
+  transformers when `input_ids` came from `apply_chat_template(...,
+  return_tensors="pt")`.
+- After "fixing" by adding `return_dict=True` and splatting with `**inputs`,
+  the same `KeyError: 'shape'` reappears at `inputs["input_ids"].shape[1]` —
+  because `inputs["input_ids"]` is itself a dict, not a tensor.
+
+**Cause.** `apply_chat_template`'s return shape when it does its own
+tokenization is version- and template-dependent on gpt-oss:
+- With `return_tensors="pt"` alone, it returns a dict-like `BatchEncoding`
+  (not a tensor). Passing that positionally as `input_ids` makes `generate`
+  try `inputs['shape']` and crash.
 - With `return_dict=True` added, some transformers/gpt-oss combinations nest
-  structured content under `input_ids` (e.g. token dicts rather than a
-  tensor), so `inputs["input_ids"].shape` then crashes too.
+  structured content under `"input_ids"` (token dicts rather than a tensor),
+  so `inputs["input_ids"].shape` crashes the same way.
 
-**Fix.** Don't ask `apply_chat_template` to tokenize at all. Render to a
-string with `tokenize=False`, then tokenize separately — this gives a clean
-`BatchEncoding` whose `input_ids` is a real tensor every time:
+The chat template's *string* rendering is stable — only the tokenization
+layer is flaky. So render to a string, then tokenize yourself.
+
+**Fix (verified working).** Two-step: `tokenize=False` to get the
+harmony-formatted string, then standard `tokenizer(...)` to get a clean
+`BatchEncoding` whose `input_ids` is always a real tensor.
 
 ```python
 try:
@@ -47,6 +56,18 @@ out = model.generate(**inputs, max_new_tokens=2048, do_sample=False,
                     pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id)
 new_tokens = out[0, input_len:]
 ```
+
+**Why this preserves the analysis channel.** `apply_chat_template(...,
+tokenize=False, reasoning_effort=...)` still injects the harmony control
+tokens (`<|start|>system<|message|>...Reasoning: high...<|channel|>analysis...`)
+into the rendered string. The model still emits `<|channel|>analysis<|message|>`
+and `<|channel|>final<|message|>` blocks; we still parse them with regex on the
+decoded output (see gotcha #4). End-to-end behavior is unchanged — only the
+tokenization step moved out of `apply_chat_template`.
+
+**Re-use this pattern.** Stage 02 (SFT) and Stage 03 (inference) should use
+the same render-then-tokenize path. `_generate` / `run_and_show` in
+`01_preprocessing.py` is the reference implementation.
 
 ---
 

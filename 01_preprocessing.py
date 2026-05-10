@@ -5,9 +5,11 @@ Stages
   1. Substantive turn filter        keep_stage1, stage1_reason
   2. Agent response polish          polished_response, polish_operations,
                                     completeness, exclude_stage2, exclude_reason
-  3. Previous-calls summary         previous_calls_summary  (cached per customer)
-  4. Current-call summary           current_call_summary
-  5. Teacher CoT + response         teacher_analysis, teacher_final
+  3. Current-call summary           current_call_summary
+  4. Previous-calls summary         previous_calls_summary  (cached per customer)
+  5. Teacher CoT + response         teacher_analysis, teacher_final, cot_grounded
+                                    (Framing B: rationalize Stage 2's polished
+                                    response; see 0510_stage5_design.md)
   + customer_context, product_context columns for downstream SFT.
 
 Importable as a library (notebook uses it) AND runnable as a CLI batch script.
@@ -21,6 +23,11 @@ Batch usage:
 
 Resume-safe: re-running with the same --output skips stages whose output
 columns already exist in the on-disk parquet.
+
+Filter cascade: stages 3, 4, 5 only run on rows that survive both
+`keep_stage1=True` and `exclude_stage2=False`. Stage 2 only runs on rows with
+`keep_stage1=True`. Ineligible rows get empty/None values in the new columns
+so the schema stays consistent across the parquet.
 """
 
 import argparse
@@ -170,23 +177,51 @@ def _parse_json_block(text: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Shared background — prepended to every stage's system prompt so the teacher
+# knows what kind of call it's looking at.
+# ---------------------------------------------------------------------------
+
+TSE_BACKGROUND = """\
+Background — TSE channel:
+This data comes from American Express's TSE (Tele Strategic Expansion) channel.
+The TSE channel engages existing American Express business customers — companies
+that already hold Amex cards but are not yet fully utilizing Amex across their
+total business spend. The agent's role is to expand the relationship and
+increase business spend on Amex products by surfacing opportunities to grow
+share of wallet across vendors, employees, and payment types."""
+
+
+# ---------------------------------------------------------------------------
 # Stage 1: Substantive turn filter
 # ---------------------------------------------------------------------------
 
-STAGE1_SYSTEM = """You are a data-quality filter for an outbound-sales SFT pipeline.
+STAGE1_SYSTEM = """You are a senior sales-call transcript analyst working on an outbound-sales SFT pipeline.
+""" + TSE_BACKGROUND + """
+Decide whether the (objection, agent response) pair is suitable as a training example
+for an objection-handling model.
 
-Decide whether the agent's response is "substantive" — i.e. contains content that
-addresses the customer's objection or hesitation beyond pure backchannels.
+A pair is SUITABLE ("keep": true) when the agent response contains learnable
+content that engages with the customer's objection or hesitation.
 
-Rules:
-- Pure backchannels alone (yeah, uh-huh, right, mm-hmm) are NOT substantive.
-- Acknowledgment + a substantive question or answer IS substantive.
-- An incomplete or fragmented response can still be substantive if its content
-  engages with the objection. Completeness is judged in a later stage; do not
-  drop rows just because the response is cut off.
+A pair is NOT SUITABLE ("keep": false) when ANY of the following apply:
+
+1. PURE BACKCHANNEL: agent response is only acknowledgments (yeah, uh-huh, right,
+   mm-hmm, okay) with no substantive content.
+
+2. COMPLIANCE / DISCLOSURE: agent is delivering required disclosures, consent
+   language, "this call is recorded," regulatory script.
+
+3. CALL OPENING / CLOSING PLEASANTRIES: greetings, sign-offs, "have a great day."
+
+4. IDENTITY VERIFICATION / PROCEDURAL: account lookup, last-4 confirmation,
+   transfer handoffs, escalation language.
+
+A response with substantive content can still be suitable even if it is
+incomplete or fragmented — completeness is judged in a later stage. Do not drop
+rows just because the response is cut off.
 
 Return ONLY a JSON object in the final channel:
-  {"keep": true|false, "reason": "<one short sentence>"}
+  {"keep": true|false, "reason": "<one short sentence citing which rule applied>"}
 """
 
 STAGE1_USER_TMPL = """TRANSCRIPT (up to objection):
@@ -215,7 +250,9 @@ def stage1_filter_one(row: dict, model, tokenizer) -> dict:
 # Stage 2: Agent response polish
 # ---------------------------------------------------------------------------
 
-STAGE2_SYSTEM = """You are a data-prep assistant for an outbound-sales SFT pipeline.
+STAGE2_SYSTEM = """You are a senior sales-call transcript analyst working on an outbound-sales SFT pipeline.
+
+""" + TSE_BACKGROUND + """
 
 Given the conversation context and a possibly-fragmented raw agent response,
 produce ONE polished agent turn that fits a single utterance.
@@ -273,10 +310,48 @@ def stage2_polish_one(row: dict, model, tokenizer) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Stage 3: Previous-calls summary (cached per customer)
+# Stage 3: Current-call summary
 # ---------------------------------------------------------------------------
 
-STAGE3_SYSTEM = """You are a relationship-history summarizer for an outbound-sales pipeline.
+STAGE3_SYSTEM = """You are a senior sales-call transcript analyst summarizing the state of an in-progress call.
+
+""" + TSE_BACKGROUND + """
+
+Given the current call transcript up to the point of the customer's objection,
+write an 50 - 300 word prose summary of the conversation state:
+  - how the call opened
+  - what's been discussed
+  - the customer's engagement signals
+  - what led to the current point
+
+This is DISTINCT from the objection summary (which describes the objection
+itself). You are describing the broader conversation state.
+
+Output prose only. No bullets, no headers. Return the summary in the final channel."""
+
+STAGE3_USER_TMPL = """CURRENT CALL TRANSCRIPT (up to the objection point):
+{transcript}
+
+Summarize the state of the conversation per the instructions. Prose only.
+"""
+
+
+def stage3_current_summary_one(row: dict, model, tokenizer) -> str:
+    user = STAGE3_USER_TMPL.format(
+        transcript=row["full_conversation_pii_rmv_till_obj"]
+    )
+    out = run_and_show(model, tokenizer, STAGE3_SYSTEM, user,
+                       reasoning_effort="medium", max_new_tokens=512)
+    return out["final"].strip()
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: Previous-calls summary (cached per customer)
+# ---------------------------------------------------------------------------
+
+STAGE4_SYSTEM = """You are a senior sales-call transcript analyst summarizing relationship history.
+
+""" + TSE_BACKGROUND + """
 
 Given the raw concatenated transcripts of prior calls with one customer, write
 a 150-300 word prose summary covering:
@@ -288,7 +363,7 @@ a 150-300 word prose summary covering:
 Output prose paragraphs only. No bullets, no headers, no preamble.
 Return the summary text in the final channel."""
 
-STAGE3_USER_TMPL = """PREVIOUS CALLS WITH THIS CUSTOMER (chronological, raw):
+STAGE4_USER_TMPL = """PREVIOUS CALLS WITH THIS CUSTOMER (chronological, raw):
 {previous_calls}
 
 Summarize the relationship history per the instructions. Prose only.
@@ -305,72 +380,76 @@ def _customer_cache_key(row: dict) -> str:
     return "hash:" + hashlib.sha1(prev.encode("utf-8")).hexdigest()
 
 
-def stage3_prev_summary_one(row: dict, model, tokenizer) -> str | None:
+def stage4_prev_summary_one(row: dict, model, tokenizer) -> str | None:
     prev = row.get("previous_calls") or ""
     if not prev.strip():
         return None
-    user = STAGE3_USER_TMPL.format(previous_calls=prev)
-    out = run_and_show(model, tokenizer, STAGE3_SYSTEM, user,
+    user = STAGE4_USER_TMPL.format(previous_calls=prev)
+    out = run_and_show(model, tokenizer, STAGE4_SYSTEM, user,
                        reasoning_effort="medium", max_new_tokens=768)
     return out["final"].strip()
 
 
 # ---------------------------------------------------------------------------
-# Stage 4: Current-call summary
+# Stage 5: Teacher CoT + response (Framing B — rationalize Stage 2's polished
+# response). Design rationale and full prompt rationale: 0510_stage5_design.md.
 # ---------------------------------------------------------------------------
 
-STAGE4_SYSTEM = """You are a call-state summarizer.
+STAGE5_SYSTEM = """You are an expert outbound sales agent at American Express on the TSE
+(Tele Strategic Expansion) channel.
 
-Given the current call transcript up to the point of the customer's objection,
-write an 80-150 word prose summary of the conversation state:
-  - how the call opened
-  - what's been discussed
-  - the customer's engagement signals
-  - what led to the current point
-
-This is DISTINCT from the objection summary (which describes the objection
-itself). You are describing the broader conversation state.
-
-Output prose only. No bullets, no headers. Return the summary in the final channel."""
-
-STAGE4_USER_TMPL = """CURRENT CALL TRANSCRIPT (up to the objection point):
-{transcript}
-
-Summarize the state of the conversation per the instructions. Prose only.
-"""
-
-
-def stage4_current_summary_one(row: dict, model, tokenizer) -> str:
-    user = STAGE4_USER_TMPL.format(
-        transcript=row["full_conversation_pii_rmv_till_obj"]
-    )
-    out = run_and_show(model, tokenizer, STAGE4_SYSTEM, user,
-                       reasoning_effort="medium", max_new_tokens=512)
-    return out["final"].strip()
-
-
-# ---------------------------------------------------------------------------
-# Stage 5: Teacher CoT + response
-# ---------------------------------------------------------------------------
-
-STAGE5_SYSTEM = """You are an expert outbound sales agent at American Express on the
-Telephone Sales Executive (TSE) channel. You speak with existing card-holding
-business customers. Your goals are to deepen the relationship, increase usage,
-and expand spend across vendors, employees, and payment types.
+""" + TSE_BACKGROUND + """
 
 You will be given:
-  - the customer's profile and product/campaign context
-  - a summary of prior calls with this customer (if any)
+  - the customer's profile and product/campaign context (industry, business size,
+    spend patterns, card portfolio, current campaign details)
+  - a summary of prior calls with this customer, if any
   - a summary of how the current call has gone so far
   - the current objection summary
   - the full transcript up to the objection point
+  - the response the agent actually gave
 
-Reason carefully in the analysis channel. Walk through:
-  customer state -> underlying concern -> strategic options -> chosen move -> response.
+Your task is to reason about WHY this response is a good move given the situation.
+A skilled agent's response is rarely arbitrary; it reflects a chain of judgment
+about the customer, the objection, and what will move the conversation forward.
+Your job is to reconstruct that judgment in the analysis channel, then echo the
+agent's response in the final channel.
 
-Then in the final channel, produce ONE natural agent turn — what the agent should
-actually say next. No script formatting, no headers, no bullets. Just the words
-the agent would speak."""
+In the analysis channel, reason in flowing natural prose — not bullets, not
+headers, not JSON, not enumerated steps. Think the way an experienced agent
+thinks silently between hearing the objection and choosing what to say. Ground
+your reasoning in the specific inputs in front of you: the customer's industry
+and what typically matters in that industry, what you know from prior calls,
+what has already happened in this call, and what the current objection actually
+signals beneath its surface wording. Walk through what response options are
+available, weigh them against each other, and arrive at the response the agent
+gave.
+
+Important: reason ONLY from the inputs you can see. Real agents often draw on
+context that isn't in your inputs — relationship history not captured in the
+prior-calls summary, pre-call research, account notes, the customer's tone of
+voice. If the agent's response appears to draw on information beyond what's
+visible to you, say so honestly in your reasoning rather than inventing context
+to justify it. For example: "Given the visible context, this response makes
+sense as a way to acknowledge the pricing concern before pivoting to value;
+the specific framing about the customer's seasonal cash flow likely also reflects
+relationship knowledge from prior interactions that isn't fully captured in the
+summary." This honesty is more useful than fabricated justification.
+
+Reason as much as the case warrants and no more. Simple cases warrant brief
+reasoning; complex cases warrant more. Do not pad. Do not restate the inputs.
+Do not enumerate steps mechanically. Do not second-guess yourself in circles;
+once you've weighed the options and chosen, move on.
+
+End your analysis with a single-line tag indicating how well the response is
+grounded in the visible inputs:
+  [grounded: high]   — response fully derivable from visible context
+  [grounded: medium] — response mostly derivable; some elements suggest unstated context
+  [grounded: low]    — response likely depends on context not visible in the inputs
+
+In the final channel, output the agent's response exactly as given. The final
+channel is not where you reason or rephrase — it's where you produce the target
+response that your analysis just explained."""
 
 STAGE5_USER_TMPL = """CUSTOMER CONTEXT:
 {customer_context}
@@ -390,13 +469,44 @@ CURRENT OBJECTION:
 FULL TRANSCRIPT UP TO THIS POINT:
 {transcript}
 
-Reason about the customer's objection in the analysis channel, and produce the
-ideal next agent response in the final channel. The final-channel response is a
-single natural agent turn, no formatting.
+THE AGENT'S RESPONSE:
+{polished_agent_response}
+
+In the analysis channel, reason about why this response is a good move given
+the situation, working only from the visible inputs and being honest about any
+points where the response appears to draw on information beyond what you can see.
+End your analysis with a [grounded: high|medium|low] tag. In the final channel,
+output the agent's response exactly as given.
 """
 
 
+_GROUNDED_RE = re.compile(
+    r"\[grounded:\s*(high|medium|low)\b[^\]]*\]\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _extract_grounded_tag(analysis: str) -> tuple[str, str]:
+    """Strip the trailing `[grounded: high|medium|low ...]` tag from the analysis.
+
+    Returns (analysis_without_tag, tag_value). tag_value is "" if not found.
+    The student trains on the stripped version (per 0510_stage5_design.md, v1
+    decision is to strip; the tag lives in its own column for diagnostics).
+    """
+    a = analysis.rstrip()
+    m = _GROUNDED_RE.search(a)
+    if not m:
+        return a, ""
+    cleaned = a[:m.start()].rstrip()
+    return cleaned, m.group(1).lower()
+
+
 def stage5_teacher_one(row: dict, model, tokenizer) -> dict:
+    polished = row.get("polished_response", "")
+    if not polished:
+        # Stage 2 must have run and produced a non-empty polished response.
+        # Eligibility mask should already exclude these, but guard anyway.
+        raise ValueError("stage 5 requires polished_response from stage 2")
     user = STAGE5_USER_TMPL.format(
         customer_context=row.get("customer_context", ""),
         product_context=row.get("product_context", ""),
@@ -404,10 +514,21 @@ def stage5_teacher_one(row: dict, model, tokenizer) -> dict:
         current_call_summary=row.get("current_call_summary", ""),
         objection_summary=row.get("objection_summary", ""),
         transcript=row["full_conversation_pii_rmv_till_obj"],
+        polished_agent_response=polished,
     )
     out = run_and_show(model, tokenizer, STAGE5_SYSTEM, user,
                        reasoning_effort="high", max_new_tokens=4096)
-    return {"teacher_analysis": out["analysis"], "teacher_final": out["final"]}
+    analysis_clean, grounded = _extract_grounded_tag(out["analysis"])
+    # Final channel should echo `polished`; log if it drifts so we can
+    # spot-check during inspection.
+    if out["final"].strip() != polished.strip():
+        logging.debug("stage5 final-channel drift from polished_response "
+                      "(len diff %d)", len(out["final"]) - len(polished))
+    return {
+        "teacher_analysis": analysis_clean,
+        "teacher_final": out["final"],
+        "cot_grounded": grounded,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -419,9 +540,9 @@ STAGE_COLS = {
     "1": ["keep_stage1", "stage1_reason"],
     "2": ["polished_response", "polish_operations", "completeness",
           "exclude_stage2", "exclude_reason"],
-    "3": ["previous_calls_summary"],
-    "4": ["current_call_summary"],
-    "5": ["teacher_analysis", "teacher_final"],
+    "3": ["current_call_summary"],
+    "4": ["previous_calls_summary"],
+    "5": ["teacher_analysis", "teacher_final", "cot_grounded"],
 }
 
 
@@ -435,6 +556,23 @@ def _save_checkpoint(df, output_path: Path, stage: str) -> None:
 
 def _has_stage_output(df, stage: str) -> bool:
     return all(c in df.columns for c in STAGE_COLS[stage])
+
+
+def _eligibility_mask(df):
+    """True for rows still eligible after stage-1 filter and stage-2 exclusion.
+
+    Used by stages 3/4/5 to skip rows that won't survive into the SFT set —
+    no point spending teacher tokens on them. If `keep_stage1` /
+    `exclude_stage2` columns aren't present yet (e.g. user ran a later stage
+    standalone), defaults to True so we don't silently no-op.
+    """
+    import pandas as pd
+    mask = pd.Series([True] * len(df), index=df.index)
+    if "keep_stage1" in df.columns:
+        mask = mask & df["keep_stage1"].fillna(False).astype(bool)
+    if "exclude_stage2" in df.columns:
+        mask = mask & ~df["exclude_stage2"].fillna(True).astype(bool)
+    return mask
 
 
 def _apply_per_row(df, fn, *, desc: str, only_where=None):
@@ -474,9 +612,8 @@ def run_stage_1(df, model, tokenizer):
 
 
 def run_stage_2(df, model, tokenizer):
-    keep_mask = df["keep_stage1"] if "keep_stage1" in df.columns else None
     out = _apply_per_row(df, lambda r: stage2_polish_one(r, model, tokenizer),
-                         desc="stage2-polish", only_where=keep_mask)
+                         desc="stage2-polish", only_where=_eligibility_mask(df))
     df = df.copy()
     def field(r, k, default):
         if not r or "_error" in r:
@@ -491,11 +628,25 @@ def run_stage_2(df, model, tokenizer):
 
 
 def run_stage_3(df, model, tokenizer):
+    out = _apply_per_row(df, lambda r: stage3_current_summary_one(r, model, tokenizer),
+                         desc="stage3-current-summary",
+                         only_where=_eligibility_mask(df))
     df = df.copy()
+    df["current_call_summary"] = [s if isinstance(s, str) else "" for s in out]
+    return df
+
+
+def run_stage_4(df, model, tokenizer):
+    df = df.copy()
+    eligible = _eligibility_mask(df).tolist()
     cache: dict[str, str | None] = {}
     summaries: list[str | None] = []
     from tqdm import tqdm
-    for row in tqdm(df.to_dict("records"), desc="stage3-prev-summary", total=len(df)):
+    records = df.to_dict("records")
+    for i, row in enumerate(tqdm(records, desc="stage4-prev-summary", total=len(df))):
+        if not eligible[i]:
+            summaries.append(None)
+            continue
         key = _customer_cache_key(row)
         if key == "":
             summaries.append(None)
@@ -504,21 +655,13 @@ def run_stage_3(df, model, tokenizer):
             summaries.append(cache[key])
             continue
         try:
-            s = stage3_prev_summary_one(row, model, tokenizer)
+            s = stage4_prev_summary_one(row, model, tokenizer)
         except Exception as e:  # noqa: BLE001
-            logging.warning("stage3 failed for key %s: %s", key, e)
+            logging.warning("stage4 failed for key %s: %s", key, e)
             s = None
         cache[key] = s
         summaries.append(s)
     df["previous_calls_summary"] = summaries
-    return df
-
-
-def run_stage_4(df, model, tokenizer):
-    out = _apply_per_row(df, lambda r: stage4_current_summary_one(r, model, tokenizer),
-                         desc="stage4-current-summary")
-    df = df.copy()
-    df["current_call_summary"] = [s if isinstance(s, str) else "" for s in out]
     return df
 
 
@@ -528,19 +671,19 @@ def run_stage_5(df, model, tokenizer):
     df["customer_context"] = [get_customer_context(r) for r in df.to_dict("records")]
     df["product_context"] = [get_product_context(r) for r in df.to_dict("records")]
 
-    # Only run on rows surviving prior filters.
-    eligible = df.get("keep_stage1", True)
-    if "exclude_stage2" in df.columns:
-        eligible = eligible & (~df["exclude_stage2"].fillna(True))
-
     out = _apply_per_row(df, lambda r: stage5_teacher_one(r, model, tokenizer),
-                         desc="stage5-teacher", only_where=eligible)
+                         desc="stage5-teacher",
+                         only_where=_eligibility_mask(df))
     df["teacher_analysis"] = [
         r.get("teacher_analysis", "") if r and "_error" not in r else ""
         for r in out
     ]
     df["teacher_final"] = [
         r.get("teacher_final", "") if r and "_error" not in r else ""
+        for r in out
+    ]
+    df["cot_grounded"] = [
+        r.get("cot_grounded", "") if r and "_error" not in r else ""
         for r in out
     ]
     return df
