@@ -1,157 +1,84 @@
-"""Stage 01: turn (transcript, target) rows into SFT-ready records.
+"""TSE SFT preprocessing pipeline (5 stages on a per-objection parquet).
 
-For each row, calls GPT-OSS once to produce:
-  - polished_target           light disfluency cleanup of `target`
-  - history_summary           1-3 sentence summary of `transcript` only
-  - reasoning                 why a top agent says polished_target here
-  - is_substantial            whether the agent had real choice in this turn
-  - is_substantial_rationale  one-liner explaining the flag
+Stages
+------
+  1. Substantive turn filter        keep_stage1, stage1_reason
+  2. Agent response polish          polished_response, polish_operations,
+                                    completeness, exclude_stage2, exclude_reason
+  3. Previous-calls summary         previous_calls_summary  (cached per customer)
+  4. Current-call summary           current_call_summary
+  5. Teacher CoT + response         teacher_analysis, teacher_final
+  + customer_context, product_context columns for downstream SFT.
 
-Output JSONL = original columns + the five fields above.
-Resume-safe: skips rows whose `transcript` SHA1 already appears in --output.
+Importable as a library (notebook uses it) AND runnable as a CLI batch script.
 
-Launch:
-    python 01_preprocessing.py --input data/raw.jsonl --output data/preprocessed.jsonl
+Batch usage:
+    python 01_preprocessing.py \
+        --input  TSE_by_objection.parquet \
+        --output TSE_preprocessed.parquet \
+        --stages 1,2,3,4,5 \
+        --cuda-visible 0,1,2,3
+
+Resume-safe: re-running with the same --output skips stages whose output
+columns already exist in the on-disk parquet.
 """
 
 import argparse
 import hashlib
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+# NB: callers that want to override CUDA_VISIBLE_DEVICES must do so BEFORE
+# importing this module (or before any function here calls torch). The CLI
+# entrypoint sets it from --cuda-visible before importing torch lazily.
 
 DEFAULT_MODEL_DIR = "/path/to/gpt-oss-120b"
-DEFAULT_WINDOW_SIZE = 50  # max turns of transcript fed to the model
-
-# Fixed system prompt for the SFT model — used by stages 02 and 03. Stage 01
-# uses its own preprocessing-specific prompt below.
-AGENT_SYSTEM_PROMPT = (
-    "You are an outbound sales agent for American Express. Your goal is to "
-    "identify customer needs and guide the conversation toward conversion. "
-    "Use the Context section, the conversation summary, and the recent transcript "
-    "to decide your next response. If the Context section below is non-empty, pay "
-    "close attention to it — it may contain product details, offers, or campaign "
-    "information that should shape your reply."
-)
 
 
-def build_agent_system_content(history_summary: str, context: str = "") -> str:
-    """System message for the SFT agent — system prompt + context block + summary.
+# ---------------------------------------------------------------------------
+# Customer / product context (edit these freely)
+# ---------------------------------------------------------------------------
 
-    The context block is always present (even when empty) so the model has a
-    consistent slot to attend to. The system prompt tells the model to weight it
-    heavily when populated.
-    """
-    ctx_text = context.strip() if context else "(none)"
+def get_customer_context(row: dict) -> str:
+    """Multi-line text block of customer info for prompt injection."""
     return (
-        f"{AGENT_SYSTEM_PROMPT}\n\n"
-        f"Context: {ctx_text}\n\n"
-        f"Conversation summary so far: {history_summary}"
+        f"Industry (SIC4): {row.get('sic4_industry', 'unknown')}\n"
+        f"Revenue tier:    {row.get('rev_tier', 'unknown')}\n"
+        f"Employee count:  {row.get('emp_ct', 'unknown')}\n"
+        f"Customer tier:   {row.get('tier', 'unknown')}\n"
     )
 
 
-_TURN_START = re.compile(r"^(agent|customer):\s*", re.MULTILINE)
+def get_product_context(row: dict) -> str:
+    """Multi-line text block of product / campaign info for prompt injection."""
+    return (
+        f"Product type:      {row.get('cw_opp_type', 'unknown')}\n"
+        f"Campaign type:     {row.get('task_type', 'unknown')}\n"
+        f"Campaign subtype:  {row.get('task_subtype', 'unknown')}\n"
+    )
 
 
-def parse_turns(transcript: str) -> list[tuple[str, str]]:
-    """Split a `agent: ... / customer: ...` transcript into ordered (speaker, text) tuples.
+# ---------------------------------------------------------------------------
+# Model loading & generation
+# ---------------------------------------------------------------------------
 
-    Each match of the speaker prefix starts a new turn; the turn's text runs to the
-    next match (or end of string), so utterances spanning multiple lines are kept intact.
+def load_teacher_model(model_dir: str = DEFAULT_MODEL_DIR):
+    """Load GPT-OSS-120B in bf16 sharded across CUDA_VISIBLE_DEVICES.
+
+    `torch_dtype=torch.bfloat16` forces dequantized expert weights through
+    `device_map="auto"` instead of staging on cuda:0 (which OOMs the first GPU
+    on torch 2.6 / triton 3.2 with `dtype="auto"`).
     """
-    matches = list(_TURN_START.finditer(transcript))
-    turns = []
-    for i, m in enumerate(matches):
-        speaker = m.group(1)
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(transcript)
-        turns.append((speaker, transcript[start:end].strip()))
-    return turns
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
-
-def render_turns(turns: list[tuple[str, str]]) -> str:
-    return "\n".join(f"{spk}: {txt}" for spk, txt in turns)
-
-
-def window_transcript(transcript: str, window_size: int) -> str:
-    """Keep only the last `window_size` turns. Preserves recency."""
-    turns = parse_turns(transcript)
-    if len(turns) <= window_size:
-        return transcript.strip()
-    return render_turns(turns[-window_size:])
-
-
-PREPROC_SYSTEM_PROMPT = """You are a data-prep assistant for an outbound-sales SFT pipeline.
-You will receive a call transcript (`transcript`) and the agent's actual next response (`target`).
-Produce ONE JSON object — and nothing else — with these fields:
-
-  polished_target          string. The `target` with disfluencies (um, uh, false starts,
-                           repeated words) removed. KEEP the original wording, tone,
-                           contractions, and sentence structure. Do NOT paraphrase or shorten.
-
-  history_summary          string. 1-3 sentences summarizing what has happened in `transcript`
-                           so far. Cover only what is in `transcript` — do not reference the
-                           target, since the target hasn't happened yet at this point.
-
-  reasoning                string. Concrete reasoning for why a top-performing agent would say
-                           `polished_target` given the conversation so far. Reference specific
-                           customer signals from the transcript. Avoid generic platitudes.
-
-  is_substantial           boolean. true if the agent had genuine freedom of choice in how to
-                           respond. false if the customer asked a rules-bound question (e.g.
-                           specific fee disclosure, compliance script) where the agent had no
-                           real latitude — these aren't useful behavioral-cloning examples.
-
-  is_substantial_rationale string. One sentence explaining why is_substantial is true or false.
-
-Return ONLY the JSON object in the final channel. No code fences, no prose around it."""
-
-SUMMARY_ONLY_SYSTEM_PROMPT = """You are a call-summarization assistant.
-Given a sales call `transcript`, produce ONE JSON object with a single field:
-
-  history_summary  string. 1-3 sentences describing what has happened in the call so far.
-
-Return ONLY the JSON object in the final channel."""
-
-_FINAL_CHANNEL_RE = re.compile(
-    r"<\|channel\|>final<\|message\|>(?P<content>.*?)(?=<\|return\|>|<\|end\|>|\Z)",
-    re.DOTALL,
-)
-
-
-def transcript_hash(transcript: str) -> str:
-    return hashlib.sha1(transcript.encode("utf-8")).hexdigest()
-
-
-def load_processed_hashes(output_path: Path) -> set[str]:
-    if not output_path.exists():
-        return set()
-    seen = set()
-    with open(output_path, "r", encoding="utf-8") as f:
-        for line in f:
-            try:
-                seen.add(transcript_hash(json.loads(line)["transcript"]))
-            except (json.JSONDecodeError, KeyError):
-                continue
-    return seen
-
-
-def load_model(model_dir: str):
-    """Load tokenizer + model with the inspection-notebook's working recipe.
-
-    `torch_dtype=torch.bfloat16` (not `dtype="auto"`): on torch 2.6 / triton 3.2
-    the MXFP4 quantizer can't keep weights packed and dequantizes every expert
-    to bf16 at load time (~240 GB). With `dtype="auto"` the dequant intermediates
-    land on cuda:0 before `device_map="auto"` dispatches the modules, OOMing the
-    first GPU. Forcing `torch_dtype=torch.bfloat16` routes those tensors through
-    device_map and shards the load across visible GPUs.
-    """
     tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+    if tokenizer.padding_side != "left":
+        tokenizer.padding_side = "left"
     model = AutoModelForCausalLM.from_pretrained(
         model_dir,
         torch_dtype=torch.bfloat16,
@@ -163,21 +90,41 @@ def load_model(model_dir: str):
     return model, tokenizer
 
 
-def _build_user_message(transcript: str, target: str | None) -> str:
-    if target is None:
-        return f"transcript:\n{transcript}"
-    return f"transcript:\n{transcript}\n\ntarget:\n{target}"
+_ANALYSIS_RE = re.compile(
+    r"<\|channel\|>analysis<\|message\|>(?P<content>.*?)(?=<\|end\|>|<\|start\|>|<\|return\|>|\Z)",
+    re.DOTALL,
+)
+_FINAL_RE = re.compile(
+    r"<\|channel\|>final<\|message\|>(?P<content>.*?)(?=<\|return\|>|<\|end\|>|\Z)",
+    re.DOTALL,
+)
 
 
-def _windowed(transcript: str, window_size: int | None) -> str:
-    if window_size is None:
-        return transcript.strip()
-    return window_transcript(transcript, window_size)
+def _split_channels(raw: str) -> tuple[str, str]:
+    """Pull analysis + final channels out of a harmony-formatted decode."""
+    a = _ANALYSIS_RE.findall(raw)
+    f = _FINAL_RE.findall(raw)
+    analysis = a[-1].strip() if a else ""
+    final = f[-1].strip() if f else raw.strip()  # fallback: treat all as final
+    return analysis, final
 
 
-def _generate(model, tokenizer, messages: list[dict], reasoning_effort: str,
-              max_new_tokens: int) -> str:
-    """Render messages, run generation, return only the final-channel text."""
+def run_and_show(
+    model,
+    tokenizer,
+    system_prompt: str,
+    user_prompt: str,
+    reasoning_effort: str = "medium",
+    max_new_tokens: int = 2048,
+    verbose: bool = False,
+) -> dict:
+    """Single-prompt inference. Returns {'analysis', 'final', 'raw'}."""
+    import torch
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
     kwargs = dict(add_generation_prompt=True, return_tensors="pt")
     try:
         input_ids = tokenizer.apply_chat_template(
@@ -185,8 +132,8 @@ def _generate(model, tokenizer, messages: list[dict], reasoning_effort: str,
         )
     except TypeError:
         input_ids = tokenizer.apply_chat_template(messages, **kwargs)
-
     input_ids = input_ids.to(model.device)
+
     with torch.no_grad():
         out = model.generate(
             input_ids,
@@ -195,15 +142,19 @@ def _generate(model, tokenizer, messages: list[dict], reasoning_effort: str,
             pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
         )
     raw = tokenizer.decode(out[0, input_ids.shape[1]:], skip_special_tokens=False)
-    matches = _FINAL_CHANNEL_RE.findall(raw)
-    if not matches:
-        # Last resort: everything stripped of specials.
-        return tokenizer.decode(out[0, input_ids.shape[1]:], skip_special_tokens=True).strip()
-    return matches[-1].strip()
+    analysis, final = _split_channels(raw)
+
+    if verbose:
+        print("=" * 30, "ANALYSIS", "=" * 30)
+        print(analysis or "(empty)")
+        print("=" * 30, "FINAL", "=" * 33)
+        print(final or "(empty)")
+        print("=" * 72)
+    return {"analysis": analysis, "final": final, "raw": raw}
 
 
 def _parse_json_block(text: str) -> dict:
-    """Tolerate stray prose around the JSON — find the outermost {...}."""
+    """Extract outermost {...}; raises ValueError if none found."""
     start = text.find("{")
     end = text.rfind("}")
     if start == -1 or end == -1 or end <= start:
@@ -211,106 +162,459 @@ def _parse_json_block(text: str) -> dict:
     return json.loads(text[start:end + 1])
 
 
-def preprocess_one(transcript: str, target: str, model, tokenizer,
-                   reasoning_effort: str = "high",
-                   max_new_tokens: int = 2048,
-                   window_size: int | None = DEFAULT_WINDOW_SIZE) -> dict:
-    """Run the full preprocessing prompt on one (transcript, target) pair.
+# ---------------------------------------------------------------------------
+# Stage 1: Substantive turn filter
+# ---------------------------------------------------------------------------
 
-    `window_size` keeps only the last N turns of `transcript` before sending it to
-    the LLM — pass None to disable windowing.
+STAGE1_SYSTEM = """You are a data-quality filter for an outbound-sales SFT pipeline.
+
+Decide whether the agent's response is "substantive" — i.e. contains content that
+addresses the customer's objection or hesitation beyond pure backchannels.
+
+Rules:
+- Pure backchannels alone (yeah, uh-huh, right, mm-hmm) are NOT substantive.
+- Acknowledgment + a substantive question or answer IS substantive.
+- An incomplete or fragmented response can still be substantive if its content
+  engages with the objection. Completeness is judged in a later stage; do not
+  drop rows just because the response is cut off.
+
+Return ONLY a JSON object in the final channel:
+  {"keep": true|false, "reason": "<one short sentence>"}
+"""
+
+STAGE1_USER_TMPL = """TRANSCRIPT (up to objection):
+{transcript}
+
+AGENT RESPONSE TO EVALUATE:
+{response}
+
+Return JSON: {{"keep": bool, "reason": "<brief>"}}
+"""
+
+
+def stage1_filter_one(row: dict, model, tokenizer) -> dict:
+    user = STAGE1_USER_TMPL.format(
+        transcript=row["full_conversation_pii_rmv_till_obj"],
+        response=row["agent_response_snippet"],
+    )
+    out = run_and_show(model, tokenizer, STAGE1_SYSTEM, user,
+                       reasoning_effort="low", max_new_tokens=256)
+    parsed = _parse_json_block(out["final"])
+    return {"keep_stage1": bool(parsed["keep"]),
+            "stage1_reason": str(parsed.get("reason", ""))}
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: Agent response polish
+# ---------------------------------------------------------------------------
+
+STAGE2_SYSTEM = """You are a data-prep assistant for an outbound-sales SFT pipeline.
+
+Given the conversation context and a possibly-fragmented raw agent response,
+produce ONE polished agent turn that fits a single utterance.
+
+Polish operations (apply uniformly, in order of priority):
+  1. filler_removal      Remove um, uh, false starts, "I mean", "you know",
+                         and "yeah"/"right" only when used as a filler. Preserve
+                         the agent's wording and rhythm; do NOT paraphrase.
+  2. repetition_collapse Collapse stutter ("the, the call") and phrase repeats.
+  3. completion          Complete obviously-truncated responses ONLY when the
+                         trajectory is unambiguous from context. Do NOT invent
+                         claims, prices, offers, commitments, or product facts.
+  4. consolidation       Multiple agent fragments separated by "|" should be
+                         merged into one coherent turn; drop pure-backchannel
+                         fragments, merge substantive ones.
+
+Do NOT rewrite for "professionalism" beyond these operations. Preserve voice.
+If polishing would require fabrication, set exclude=true with a reason.
+
+Return ONLY JSON in the final channel:
+  {
+    "polished_response": "<one clean agent turn>",
+    "operations_applied": ["filler_removal", "repetition_collapse", ...],
+    "completeness": "complete" | "completed_from_context" | "incomplete",
+    "exclude": false,
+    "exclude_reason": null
+  }
+"""
+
+STAGE2_USER_TMPL = """TRANSCRIPT CONTEXT (what the agent was responding to):
+{transcript}
+
+RAW AGENT RESPONSE (possibly fragmented, with fillers):
+{response}
+
+Apply minimal polish per the schema. Return JSON only.
+"""
+
+
+def stage2_polish_one(row: dict, model, tokenizer) -> dict:
+    user = STAGE2_USER_TMPL.format(
+        transcript=row["full_conversation_pii_rmv_till_obj"],
+        response=row["agent_response_snippet"],
+    )
+    out = run_and_show(model, tokenizer, STAGE2_SYSTEM, user,
+                       reasoning_effort="medium", max_new_tokens=1024)
+    parsed = _parse_json_block(out["final"])
+    return {
+        "polished_response": str(parsed.get("polished_response", "")),
+        "polish_operations": list(parsed.get("operations_applied", []) or []),
+        "completeness": str(parsed.get("completeness", "")),
+        "exclude_stage2": bool(parsed.get("exclude", False)),
+        "exclude_reason": parsed.get("exclude_reason"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Stage 3: Previous-calls summary (cached per customer)
+# ---------------------------------------------------------------------------
+
+STAGE3_SYSTEM = """You are a relationship-history summarizer for an outbound-sales pipeline.
+
+Given the raw concatenated transcripts of prior calls with one customer, write
+a 150-300 word prose summary covering:
+  - products discussed
+  - customer concerns and objections raised in prior calls
+  - outcomes / next steps that were agreed
+  - the customer's communication style and engagement level
+
+Output prose paragraphs only. No bullets, no headers, no preamble.
+Return the summary text in the final channel."""
+
+STAGE3_USER_TMPL = """PREVIOUS CALLS WITH THIS CUSTOMER (chronological, raw):
+{previous_calls}
+
+Summarize the relationship history per the instructions. Prose only.
+"""
+
+
+def _customer_cache_key(row: dict) -> str:
+    prev = row.get("previous_calls") or ""
+    if not prev.strip():
+        return ""
+    cust = row.get("customer_id") or row.get("cust_id") or ""
+    if cust:
+        return f"cust:{cust}"
+    return "hash:" + hashlib.sha1(prev.encode("utf-8")).hexdigest()
+
+
+def stage3_prev_summary_one(row: dict, model, tokenizer) -> str | None:
+    prev = row.get("previous_calls") or ""
+    if not prev.strip():
+        return None
+    user = STAGE3_USER_TMPL.format(previous_calls=prev)
+    out = run_and_show(model, tokenizer, STAGE3_SYSTEM, user,
+                       reasoning_effort="medium", max_new_tokens=768)
+    return out["final"].strip()
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: Current-call summary
+# ---------------------------------------------------------------------------
+
+STAGE4_SYSTEM = """You are a call-state summarizer.
+
+Given the current call transcript up to the point of the customer's objection,
+write an 80-150 word prose summary of the conversation state:
+  - how the call opened
+  - what's been discussed
+  - the customer's engagement signals
+  - what led to the current point
+
+This is DISTINCT from the objection summary (which describes the objection
+itself). You are describing the broader conversation state.
+
+Output prose only. No bullets, no headers. Return the summary in the final channel."""
+
+STAGE4_USER_TMPL = """CURRENT CALL TRANSCRIPT (up to the objection point):
+{transcript}
+
+Summarize the state of the conversation per the instructions. Prose only.
+"""
+
+
+def stage4_current_summary_one(row: dict, model, tokenizer) -> str:
+    user = STAGE4_USER_TMPL.format(
+        transcript=row["full_conversation_pii_rmv_till_obj"]
+    )
+    out = run_and_show(model, tokenizer, STAGE4_SYSTEM, user,
+                       reasoning_effort="medium", max_new_tokens=512)
+    return out["final"].strip()
+
+
+# ---------------------------------------------------------------------------
+# Stage 5: Teacher CoT + response
+# ---------------------------------------------------------------------------
+
+STAGE5_SYSTEM = """You are an expert outbound sales agent at American Express on the
+Telephone Sales Executive (TSE) channel. You speak with existing card-holding
+business customers. Your goals are to deepen the relationship, increase usage,
+and expand spend across vendors, employees, and payment types.
+
+You will be given:
+  - the customer's profile and product/campaign context
+  - a summary of prior calls with this customer (if any)
+  - a summary of how the current call has gone so far
+  - the current objection summary
+  - the full transcript up to the objection point
+
+Reason carefully in the analysis channel. Walk through:
+  customer state -> underlying concern -> strategic options -> chosen move -> response.
+
+Then in the final channel, produce ONE natural agent turn — what the agent should
+actually say next. No script formatting, no headers, no bullets. Just the words
+the agent would speak."""
+
+STAGE5_USER_TMPL = """CUSTOMER CONTEXT:
+{customer_context}
+
+PRODUCT / CAMPAIGN CONTEXT:
+{product_context}
+
+PREVIOUS RELATIONSHIP HISTORY:
+{previous_calls_summary}
+
+CURRENT CALL SO FAR:
+{current_call_summary}
+
+CURRENT OBJECTION:
+{objection_summary}
+
+FULL TRANSCRIPT UP TO THIS POINT:
+{transcript}
+
+Reason about the customer's objection in the analysis channel, and produce the
+ideal next agent response in the final channel. The final-channel response is a
+single natural agent turn, no formatting.
+"""
+
+
+def stage5_teacher_one(row: dict, model, tokenizer) -> dict:
+    user = STAGE5_USER_TMPL.format(
+        customer_context=row.get("customer_context", ""),
+        product_context=row.get("product_context", ""),
+        previous_calls_summary=row.get("previous_calls_summary") or "(no prior calls)",
+        current_call_summary=row.get("current_call_summary", ""),
+        objection_summary=row.get("objection_summary", ""),
+        transcript=row["full_conversation_pii_rmv_till_obj"],
+    )
+    out = run_and_show(model, tokenizer, STAGE5_SYSTEM, user,
+                       reasoning_effort="high", max_new_tokens=4096)
+    return {"teacher_analysis": out["analysis"], "teacher_final": out["final"]}
+
+
+# ---------------------------------------------------------------------------
+# Batch driver
+# ---------------------------------------------------------------------------
+
+# Output columns each stage adds — used for resume detection.
+STAGE_COLS = {
+    "1": ["keep_stage1", "stage1_reason"],
+    "2": ["polished_response", "polish_operations", "completeness",
+          "exclude_stage2", "exclude_reason"],
+    "3": ["previous_calls_summary"],
+    "4": ["current_call_summary"],
+    "5": ["teacher_analysis", "teacher_final"],
+}
+
+
+def _save_checkpoint(df, output_path: Path, stage: str) -> None:
+    tmp = output_path.with_suffix(output_path.suffix + ".tmp")
+    df.to_parquet(tmp, index=False)
+    os.replace(tmp, output_path)
+    logging.info("Checkpoint saved after stage %s -> %s (%d rows)",
+                 stage, output_path, len(df))
+
+
+def _has_stage_output(df, stage: str) -> bool:
+    return all(c in df.columns for c in STAGE_COLS[stage])
+
+
+def _apply_per_row(df, fn, *, desc: str, only_where=None):
+    """Apply fn(row_dict) to each row; returns list of result dicts (or None on error).
+
+    `only_where` is an optional boolean Series; rows where False get None.
     """
-    messages = [
-        {"role": "system", "content": PREPROC_SYSTEM_PROMPT},
-        {"role": "user", "content": _build_user_message(_windowed(transcript, window_size), target)},
-    ]
-    final_text = _generate(model, tokenizer, messages, reasoning_effort, max_new_tokens)
-    parsed = _parse_json_block(final_text)
-    required = {"polished_target", "history_summary", "reasoning",
-                "is_substantial", "is_substantial_rationale"}
-    missing = required - parsed.keys()
-    if missing:
-        raise ValueError(f"missing fields {missing} in: {final_text[:300]}")
-    return parsed
+    from tqdm import tqdm
+    results = []
+    n_err = 0
+    iterator = tqdm(df.to_dict("records"), desc=desc, total=len(df))
+    for i, row in enumerate(iterator):
+        if only_where is not None and not bool(only_where.iloc[i]):
+            results.append(None)
+            continue
+        try:
+            results.append(fn(row))
+        except Exception as e:  # noqa: BLE001 — isolated per row
+            logging.warning("%s row %d failed: %s", desc, i, e)
+            results.append({"_error": str(e)})
+            n_err += 1
+    if n_err:
+        logging.warning("%s: %d rows errored", desc, n_err)
+    return results
 
 
-def generate_summary_only(transcript: str, model, tokenizer,
-                          reasoning_effort: str = "medium",
-                          max_new_tokens: int = 512,
-                          window_size: int | None = DEFAULT_WINDOW_SIZE) -> str:
-    """Used by stage 03 — only the summary, target not available at inference."""
-    messages = [
-        {"role": "system", "content": SUMMARY_ONLY_SYSTEM_PROMPT},
-        {"role": "user", "content": _build_user_message(_windowed(transcript, window_size), target=None)},
+def run_stage_1(df, model, tokenizer):
+    out = _apply_per_row(df, lambda r: stage1_filter_one(r, model, tokenizer),
+                         desc="stage1-filter")
+    df = df.copy()
+    df["keep_stage1"] = [bool(r.get("keep_stage1")) if r and "_error" not in r else False
+                        for r in out]
+    df["stage1_reason"] = [r.get("stage1_reason", "") if r and "_error" not in r
+                           else r.get("_error", "") if r else ""
+                           for r in out]
+    return df
+
+
+def run_stage_2(df, model, tokenizer):
+    keep_mask = df["keep_stage1"] if "keep_stage1" in df.columns else None
+    out = _apply_per_row(df, lambda r: stage2_polish_one(r, model, tokenizer),
+                         desc="stage2-polish", only_where=keep_mask)
+    df = df.copy()
+    def field(r, k, default):
+        if not r or "_error" in r:
+            return default
+        return r.get(k, default)
+    df["polished_response"] = [field(r, "polished_response", "") for r in out]
+    df["polish_operations"] = [field(r, "polish_operations", []) for r in out]
+    df["completeness"] = [field(r, "completeness", "") for r in out]
+    df["exclude_stage2"] = [bool(field(r, "exclude_stage2", True)) for r in out]
+    df["exclude_reason"] = [field(r, "exclude_reason", None) for r in out]
+    return df
+
+
+def run_stage_3(df, model, tokenizer):
+    df = df.copy()
+    cache: dict[str, str | None] = {}
+    summaries: list[str | None] = []
+    from tqdm import tqdm
+    for row in tqdm(df.to_dict("records"), desc="stage3-prev-summary", total=len(df)):
+        key = _customer_cache_key(row)
+        if key == "":
+            summaries.append(None)
+            continue
+        if key in cache:
+            summaries.append(cache[key])
+            continue
+        try:
+            s = stage3_prev_summary_one(row, model, tokenizer)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("stage3 failed for key %s: %s", key, e)
+            s = None
+        cache[key] = s
+        summaries.append(s)
+    df["previous_calls_summary"] = summaries
+    return df
+
+
+def run_stage_4(df, model, tokenizer):
+    out = _apply_per_row(df, lambda r: stage4_current_summary_one(r, model, tokenizer),
+                         desc="stage4-current-summary")
+    df = df.copy()
+    df["current_call_summary"] = [s if isinstance(s, str) else "" for s in out]
+    return df
+
+
+def run_stage_5(df, model, tokenizer):
+    df = df.copy()
+    # Ensure customer/product context cols exist (cheap to recompute).
+    df["customer_context"] = [get_customer_context(r) for r in df.to_dict("records")]
+    df["product_context"] = [get_product_context(r) for r in df.to_dict("records")]
+
+    # Only run on rows surviving prior filters.
+    eligible = df.get("keep_stage1", True)
+    if "exclude_stage2" in df.columns:
+        eligible = eligible & (~df["exclude_stage2"].fillna(True))
+
+    out = _apply_per_row(df, lambda r: stage5_teacher_one(r, model, tokenizer),
+                         desc="stage5-teacher", only_where=eligible)
+    df["teacher_analysis"] = [
+        r.get("teacher_analysis", "") if r and "_error" not in r else ""
+        for r in out
     ]
-    final_text = _generate(model, tokenizer, messages, reasoning_effort, max_new_tokens)
-    return _parse_json_block(final_text)["history_summary"]
+    df["teacher_final"] = [
+        r.get("teacher_final", "") if r and "_error" not in r else ""
+        for r in out
+    ]
+    return df
+
+
+STAGE_RUNNERS = {
+    "1": run_stage_1,
+    "2": run_stage_2,
+    "3": run_stage_3,
+    "4": run_stage_4,
+    "5": run_stage_5,
+}
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--input", required=True, help="JSONL with at least `transcript` and `target`")
-    p.add_argument("--output", required=True, help="JSONL output (resume-safe)")
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    p.add_argument("--input", required=True, help="Input parquet (one row per objection)")
+    p.add_argument("--output", required=True, help="Output parquet (resume-safe)")
     p.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
-    p.add_argument("--max-samples", type=int, default=None)
-    p.add_argument("--reasoning-effort", default="high", choices=["low", "medium", "high"])
-    p.add_argument("--window-size", type=int, default=DEFAULT_WINDOW_SIZE,
-                   help="Keep only the last N turns of `transcript` before sending to the LLM. "
-                        "Pass 0 to disable windowing.")
-    p.add_argument("--log-every", type=int, default=10)
+    p.add_argument("--stages", default="1,2,3,4,5",
+                   help="Comma-separated stages to run, e.g. '1,2,3,4,5'")
+    p.add_argument("--limit", type=int, default=None,
+                   help="Process only first N rows (smoke testing)")
+    p.add_argument("--cuda-visible", default=None,
+                   help="Set CUDA_VISIBLE_DEVICES, e.g. '0,1,2,3'")
+    p.add_argument("--resume", action="store_true",
+                   help="Read existing --output and skip stages whose columns exist")
     return p.parse_args()
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
     args = parse_args()
+
+    if args.cuda_visible is not None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible
+        logging.info("CUDA_VISIBLE_DEVICES=%s", args.cuda_visible)
+
+    import pandas as pd  # imported here so CUDA_VISIBLE_DEVICES is set first
+
     in_path = Path(args.input)
     out_path = Path(args.output)
-    fail_path = out_path.with_name(out_path.stem + "_failures.jsonl")
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    stages = [s.strip() for s in args.stages.split(",") if s.strip()]
+    for s in stages:
+        if s not in STAGE_RUNNERS:
+            raise SystemExit(f"unknown stage {s!r}; valid: {list(STAGE_RUNNERS)}")
 
-    seen = load_processed_hashes(out_path)
-    logging.info("Resume: %d rows already in %s", len(seen), out_path)
+    if args.resume and out_path.exists():
+        df = pd.read_parquet(out_path)
+        logging.info("Resuming from %s (%d rows)", out_path, len(df))
+    else:
+        df = pd.read_parquet(in_path)
+        logging.info("Loaded %s (%d rows)", in_path, len(df))
+    if args.limit is not None:
+        df = df.head(args.limit).copy()
 
-    model, tokenizer = load_model(args.model_dir)
-    logging.info("Model loaded.")
+    # Always materialize context columns up front — they're cheap and Stage 5 reads them.
+    df["customer_context"] = [get_customer_context(r) for r in df.to_dict("records")]
+    df["product_context"] = [get_product_context(r) for r in df.to_dict("records")]
 
-    n_done, n_fail = 0, 0
+    model, tokenizer = load_teacher_model(args.model_dir)
+    logging.info("Teacher model loaded.")
+
     t0 = time.perf_counter()
-    with open(in_path, "r", encoding="utf-8") as fin, \
-         open(out_path, "a", encoding="utf-8") as fout, \
-         open(fail_path, "a", encoding="utf-8") as fbad:
-        for i, line in enumerate(fin):
-            if args.max_samples is not None and (n_done + n_fail) >= args.max_samples:
-                break
-            row = json.loads(line)
-            if "transcript" not in row or "target" not in row:
-                logging.warning("row %d missing transcript/target — skipping", i)
-                continue
-            if transcript_hash(row["transcript"]) in seen:
-                continue
-            try:
-                parsed = preprocess_one(
-                    row["transcript"], row["target"], model, tokenizer,
-                    reasoning_effort=args.reasoning_effort,
-                    window_size=args.window_size if args.window_size > 0 else None,
-                )
-            except Exception as e:  # noqa: BLE001 — preprocessing failures are isolated per row
-                fbad.write(json.dumps({"row_index": i, "error": str(e), **row}) + "\n")
-                fbad.flush()
-                n_fail += 1
-                continue
-            row.update(parsed)
-            fout.write(json.dumps(row, ensure_ascii=False) + "\n")
-            fout.flush()
-            n_done += 1
-            if n_done % args.log_every == 0:
-                rate = n_done / (time.perf_counter() - t0)
-                logging.info("Done %d (failed %d) | %.2f rows/s", n_done, n_fail, rate)
+    for s in stages:
+        if args.resume and _has_stage_output(df, s):
+            logging.info("Stage %s already present — skipping", s)
+            continue
+        logging.info("=== Stage %s ===", s)
+        t_stage = time.perf_counter()
+        df = STAGE_RUNNERS[s](df, model, tokenizer)
+        logging.info("Stage %s done in %.1fs", s, time.perf_counter() - t_stage)
+        _save_checkpoint(df, out_path, stage=s)
 
-    logging.info("Finished. Done=%d Failed=%d in %.1fs", n_done, n_fail,
-                 time.perf_counter() - t0)
+    df.to_parquet(out_path, index=False)
+    logging.info("All stages done in %.1fs. Wrote %s (%d rows)",
+                 time.perf_counter() - t0, out_path, len(df))
 
 
 if __name__ == "__main__":
