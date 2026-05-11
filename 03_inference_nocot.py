@@ -1,23 +1,31 @@
 """Batch inference for the no-CoT LoRA SFT adapter — DataFrame in, parquet out.
 
-Mirrors the prompt construction of `02_sft_training_nocot_0511.py` exactly so
-adapters saved at any step (final or intermediate `checkpoint-N/`) can be
-evaluated with train/inference parity.
+Self-contained: defines all generation, channel-parsing, and model-loading
+helpers internally. The ONLY external project import is
+`02_sft_training_nocot_0511.py` for the prompt templates
+(`SYSTEM_CONTENT`, `USER_TMPL`, `trim_transcript`,
+`DEFAULT_MAX_TRANSCRIPT_CHARS`, `get_customer_context`) — re-exported below
+so both this script and `03_inference_nocot.ipynb` share one source of truth
+and stay in lockstep with training.
 
 Pipeline per row:
   1. Build messages = [system=SYSTEM_CONTENT, user=USER_TMPL.format(4 inputs)]
      using the same templates the training script uses.
-  2. Render with `apply_chat_template(..., add_generation_prompt=True)` and the
-     requested `reasoning_effort`.
-  3. Batched greedy generate (`do_sample=False`).
+  2. Render via `apply_chat_template(..., tokenize=False)` with the requested
+     `reasoning_effort`. We tokenize separately to get a clean BatchEncoding
+     (newer transformers versions return BatchEncoding for some chat templates
+     and a plain tensor for others when `return_tensors="pt"` is set inside
+     apply_chat_template — splitting the call avoids that ambiguity).
+  3. Batched greedy generate (`do_sample=False`) with explicit
+     `input_ids` + `attention_mask` (required for correct left-padding).
   4. Decode each row with `skip_special_tokens=False`; parse `analysis` and
-     `final` channels out of the raw decode via `infer03.parse_channels`.
+     `final` channels via `parse_channels`.
   5. (Optional) repeat under `model.disable_adapter()` for an A/B against base.
 
 Input DataFrame columns required:
     transcript, previous_call_summary, current_call_summary, objection_summary
 Optional:
-    customer_context  (else `train02.get_customer_context(row)` fallback / "")
+    customer_context  (else `get_customer_context(row)` fallback / "")
 
 Output: input DataFrame + columns
     raw_response, analysis, final
@@ -36,18 +44,21 @@ Example:
         --max-new-tokens 1024 \\
         --reasoning-effort medium
 
-To evaluate an intermediate checkpoint, just point `--adapter-dir` at it:
+To evaluate an intermediate checkpoint, point `--adapter-dir` at it:
     --adapter-dir checkpoints_nocot/checkpoint-90
 """
 
 import argparse
 import importlib.util
 import logging
+import re
 import time
 from pathlib import Path
 
 import pandas as pd
 import torch
+from peft import PeftModel
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 _HERE = Path(__file__).resolve().parent
 
@@ -59,8 +70,13 @@ def _load_module(name: str, filename: str):
     return mod
 
 
-train02 = _load_module("train02_nocot", "02_sft_training_nocot_0511.py")
-infer03 = _load_module("infer03", "03_inference.py")
+# Only external project dependency: prompt templates from the training script.
+_train = _load_module("train02_nocot", "02_sft_training_nocot_0511.py")
+SYSTEM_CONTENT = _train.SYSTEM_CONTENT
+USER_TMPL = _train.USER_TMPL
+trim_transcript = _train.trim_transcript
+get_customer_context = _train.get_customer_context
+DEFAULT_MAX_TRANSCRIPT_CHARS = _train.DEFAULT_MAX_TRANSCRIPT_CHARS
 
 DEFAULT_MODEL_DIR = "/path/to/gpt-oss-120b"
 DEFAULT_ADAPTER_DIR = "checkpoints_nocot/final_adapter"
@@ -73,52 +89,73 @@ REQUIRED_COLS = (
 )
 
 
-def build_prefix_text(tokenizer, row: dict, max_transcript_chars: int) -> str:
-    """Replicates `train02.build_prefix_text` minus the truncate-counter side effect."""
-    transcript_trimmed, _ = train02.trim_transcript(
-        row["transcript"], max_transcript_chars
-    )
-    user_text = train02.USER_TMPL.format(
-        customer_context=row.get("customer_context") or train02.get_customer_context(row),
-        previous_call_summary=row["previous_call_summary"],
-        current_call_summary=row["current_call_summary"],
-        objection_summary=row["objection_summary"],
-        transcript=transcript_trimmed,
-    )
-    messages = [
-        {"role": "system", "content": train02.SYSTEM_CONTENT},
-        {"role": "user", "content": user_text},
-    ]
-    return tokenizer.apply_chat_template(
-        messages, add_generation_prompt=True, tokenize=False
-    )
+# ============================================================================
+# CHANNEL PARSING
+# ============================================================================
+
+_CHANNEL_RE = re.compile(
+    r"<\|channel\|>(?P<channel>[^<]+?)<\|message\|>(?P<content>.*?)"
+    r"(?=<\|end\|>|<\|return\|>|<\|call\|>|<\|channel\|>|\Z)",
+    re.DOTALL,
+)
 
 
-def render_batch(tokenizer, rows: list[dict], reasoning_effort: str,
-                 max_transcript_chars: int) -> dict:
-    """Render a batch of rows as a left-padded tokenized batch.
+def parse_channels(raw_text: str) -> dict:
+    """Return {'analysis': str, 'final': str} from a raw Harmony decode."""
+    out = {"analysis": "", "final": ""}
+    for m in _CHANNEL_RE.finditer(raw_text):
+        ch = m.group("channel").strip()
+        if ch in out:
+            out[ch] += m.group("content")
+    return out
 
-    `reasoning_effort` is injected via the same try/except shim
-    `infer03.render_input_ids` uses (tokenizers without that kwarg fall back).
+
+# ============================================================================
+# TOKENIZATION + GENERATION
+# ============================================================================
+
+def render_prompt_text(tokenizer, messages: list[dict],
+                       reasoning_effort: str) -> str:
+    """Apply the chat template with `reasoning_effort` and `add_generation_prompt`.
+
+    Returns a plain string. Tokenization happens separately so callers always
+    get a clean BatchEncoding (with `input_ids` AND `attention_mask`) instead
+    of the BatchEncoding-vs-tensor surprise that some transformers versions
+    produce when `return_tensors="pt"` is passed inside `apply_chat_template`.
     """
-    prefix_texts = [
-        build_prefix_text(tokenizer, r, max_transcript_chars) for r in rows
-    ]
-    # Re-tokenize: apply_chat_template already gave us the strings; tokenize them
-    # together with padding so we can batch.
-    enc = tokenizer(
-        prefix_texts,
-        padding=True,
-        return_tensors="pt",
-        add_special_tokens=False,
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            reasoning_effort=reasoning_effort,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False,
+        )
+
+
+def encode_one(tokenizer, text: str):
+    """Tokenize a single prompt string into a BatchEncoding on CPU."""
+    return tokenizer(text, return_tensors="pt", add_special_tokens=False)
+
+
+def encode_batch(tokenizer, texts: list[str]):
+    """Tokenize a list of prompt strings with left padding (decoder-only generate)."""
+    return tokenizer(
+        texts, return_tensors="pt", add_special_tokens=False, padding=True,
     )
-    return enc
 
 
-def generate_batch(model, tokenizer, enc, max_new_tokens: int) -> list[str]:
-    """Greedy batched generate. Returns one decoded string per row (suffix-only)."""
-    input_ids = enc["input_ids"].to(model.device)
-    attention_mask = enc["attention_mask"].to(model.device)
+def generate_from_inputs(model, tokenizer, inputs, max_new_tokens: int) -> list[str]:
+    """Greedy batched generate. Returns one decoded suffix string per row.
+
+    `inputs` is a BatchEncoding (or dict) with `input_ids` + `attention_mask`.
+    Works for batch size 1 too; always returns a list.
+    """
+    input_ids = inputs["input_ids"].to(model.device)
+    attention_mask = inputs["attention_mask"].to(model.device)
     with torch.no_grad():
         out = model.generate(
             input_ids=input_ids,
@@ -127,38 +164,127 @@ def generate_batch(model, tokenizer, enc, max_new_tokens: int) -> list[str]:
             do_sample=False,
             pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
         )
-    # left-padded: prompt occupies the last `prompt_len` positions of input_ids,
-    # which equals input_ids.shape[1]. The newly generated tokens are appended
-    # past that index in `out`.
     prompt_len = input_ids.shape[1]
     suffix_ids = out[:, prompt_len:]
     return tokenizer.batch_decode(suffix_ids, skip_special_tokens=False)
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    p.add_argument("--input", required=True, help="Parquet (or .csv) of input rows.")
-    p.add_argument("--output", required=True, help="Parquet destination.")
-    p.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
-    p.add_argument("--adapter-dir", default=DEFAULT_ADAPTER_DIR,
-                   help="LoRA adapter dir — final_adapter/ OR any checkpoint-N/.")
-    p.add_argument("--batch-size", type=int, default=4)
-    p.add_argument("--max-new-tokens", type=int, default=1024)
-    p.add_argument("--reasoning-effort", default="medium",
-                   choices=["low", "medium", "high"])
-    p.add_argument("--max-transcript-chars", type=int,
-                   default=train02.DEFAULT_MAX_TRANSCRIPT_CHARS,
-                   help="Char-cap from end of transcript — same default as training.")
-    p.add_argument("--max-samples", type=int, default=None,
-                   help="Smoke cap; processes only first N rows after resume skip.")
-    p.add_argument("--include-base", action="store_true",
-                   help="Also generate with `model.disable_adapter()` for A/B.")
-    p.add_argument("--save-every", type=int, default=10,
-                   help="Persist partial parquet every N batches.")
-    return p.parse_args()
+# ============================================================================
+# MODEL LOAD
+# ============================================================================
 
+def load_model_with_adapter(model_dir: str, adapter_dir: str):
+    """Single-process load: base model with `device_map='auto'` + PEFT adapter.
+
+    `adapter_dir` may point at either `.../final_adapter` or any intermediate
+    `.../checkpoint-N`; PEFT only needs `adapter_config.json` + the adapter
+    weights file.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(model_dir, local_files_only=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"  # decoder-only batched generation
+    base = AutoModelForCausalLM.from_pretrained(
+        model_dir, dtype="auto", device_map="auto",
+        local_files_only=True, low_cpu_mem_usage=True,
+    )
+    model = PeftModel.from_pretrained(base, adapter_dir)
+    model.eval()
+    return model, tokenizer
+
+
+# ============================================================================
+# PROMPT CONSTRUCTION (mirrors training-script exactly)
+# ============================================================================
+
+def build_messages(transcript: str, previous_call_summary: str,
+                   current_call_summary: str, objection_summary: str,
+                   customer_context: str,
+                   max_transcript_chars: int = DEFAULT_MAX_TRANSCRIPT_CHARS) -> list[dict]:
+    """Build the 2-message system+user list, trimming transcript like training does."""
+    transcript_trimmed, _ = trim_transcript(transcript, max_transcript_chars)
+    user_text = USER_TMPL.format(
+        customer_context=customer_context,
+        previous_call_summary=previous_call_summary,
+        current_call_summary=current_call_summary,
+        objection_summary=objection_summary,
+        transcript=transcript_trimmed,
+    )
+    return [
+        {"role": "system", "content": SYSTEM_CONTENT},
+        {"role": "user", "content": user_text},
+    ]
+
+
+def generate_response(model, tokenizer, transcript: str,
+                      previous_call_summary: str,
+                      current_call_summary: str,
+                      objection_summary: str,
+                      customer_context: str = "",
+                      reasoning_effort: str = "medium",
+                      max_new_tokens: int = 1024,
+                      max_transcript_chars: int = DEFAULT_MAX_TRANSCRIPT_CHARS,
+                      include_base: bool = False) -> dict:
+    """Single-row helper.
+
+    Returns {raw, analysis, final}, plus {base_raw, base_analysis, base_final}
+    when `include_base=True`.
+    """
+    messages = build_messages(
+        transcript=transcript,
+        previous_call_summary=previous_call_summary,
+        current_call_summary=current_call_summary,
+        objection_summary=objection_summary,
+        customer_context=customer_context,
+        max_transcript_chars=max_transcript_chars,
+    )
+    text = render_prompt_text(tokenizer, messages, reasoning_effort)
+    inputs = encode_one(tokenizer, text)
+    raw = generate_from_inputs(model, tokenizer, inputs, max_new_tokens)[0]
+    parsed = parse_channels(raw)
+    result = {"raw": raw, "analysis": parsed["analysis"], "final": parsed["final"]}
+    if include_base:
+        with model.disable_adapter():
+            base_raw = generate_from_inputs(model, tokenizer, inputs, max_new_tokens)[0]
+        bp = parse_channels(base_raw)
+        result["base_raw"] = base_raw
+        result["base_analysis"] = bp["analysis"]
+        result["base_final"] = bp["final"]
+    return result
+
+
+# ============================================================================
+# BATCH PIPELINE
+# ============================================================================
+
+def _row_customer_context(row: dict) -> str:
+    """Prefer explicit `customer_context` column; fall back to training-script fetcher."""
+    val = row.get("customer_context")
+    if val is None or (isinstance(val, float) and pd.isna(val)) or val == "":
+        return get_customer_context(row) or ""
+    return str(val)
+
+
+def render_batch(tokenizer, rows: list[dict], reasoning_effort: str,
+                 max_transcript_chars: int):
+    """Render a batch of rows as a left-padded BatchEncoding."""
+    texts = []
+    for r in rows:
+        messages = build_messages(
+            transcript=r["transcript"],
+            previous_call_summary=r["previous_call_summary"],
+            current_call_summary=r["current_call_summary"],
+            objection_summary=r["objection_summary"],
+            customer_context=_row_customer_context(r),
+            max_transcript_chars=max_transcript_chars,
+        )
+        texts.append(render_prompt_text(tokenizer, messages, reasoning_effort))
+    return encode_batch(tokenizer, texts)
+
+
+# ============================================================================
+# I/O + RESUME
+# ============================================================================
 
 def read_input(path: Path) -> pd.DataFrame:
     if path.suffix.lower() == ".csv":
@@ -187,23 +313,52 @@ def init_output_columns(df: pd.DataFrame, include_base: bool) -> pd.DataFrame:
 
 def load_existing_output(out_path: Path, df_in: pd.DataFrame,
                          include_base: bool) -> pd.DataFrame:
-    """Resume: if output parquet exists and aligns row-for-row with input, reuse."""
+    """Resume: if output parquet exists and aligns row-for-row, reuse it."""
     if not out_path.exists():
         return init_output_columns(df_in.copy(), include_base)
     existing = pd.read_parquet(out_path)
     if len(existing) != len(df_in):
         logging.warning(
-            "Existing output has %d rows but input has %d — ignoring existing "
-            "and starting fresh.", len(existing), len(df_in),
+            "Existing output has %d rows but input has %d — ignoring existing.",
+            len(existing), len(df_in),
         )
         return init_output_columns(df_in.copy(), include_base)
     return init_output_columns(existing, include_base)
 
 
 def pending_indices(df: pd.DataFrame) -> list[int]:
-    """Row indices where `final` is still NA — i.e., not yet generated."""
+    """Row indices where `final` is still NA — not yet generated."""
     mask = df["final"].isna()
     return df.index[mask].tolist()
+
+
+# ============================================================================
+# CLI
+# ============================================================================
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    p.add_argument("--input", required=True, help="Parquet (or .csv) of input rows.")
+    p.add_argument("--output", required=True, help="Parquet destination.")
+    p.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
+    p.add_argument("--adapter-dir", default=DEFAULT_ADAPTER_DIR,
+                   help="LoRA adapter dir — final_adapter/ OR any checkpoint-N/.")
+    p.add_argument("--batch-size", type=int, default=4)
+    p.add_argument("--max-new-tokens", type=int, default=1024)
+    p.add_argument("--reasoning-effort", default="medium",
+                   choices=["low", "medium", "high"])
+    p.add_argument("--max-transcript-chars", type=int,
+                   default=DEFAULT_MAX_TRANSCRIPT_CHARS,
+                   help="Char-cap from end of transcript — same default as training.")
+    p.add_argument("--max-samples", type=int, default=None,
+                   help="Smoke cap; processes only first N pending rows.")
+    p.add_argument("--include-base", action="store_true",
+                   help="Also generate with `model.disable_adapter()` for A/B.")
+    p.add_argument("--save-every", type=int, default=10,
+                   help="Persist partial parquet every N batches.")
+    return p.parse_args()
 
 
 def main() -> None:
@@ -229,10 +384,7 @@ def main() -> None:
         logging.info("Nothing to do. Output already complete: %s", out_path)
         return
 
-    model, tokenizer = infer03.load_model_with_adapter(args.model_dir, args.adapter_dir)
-    tokenizer.padding_side = "left"
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+    model, tokenizer = load_model_with_adapter(args.model_dir, args.adapter_dir)
     logging.info("Model + adapter loaded from %s", args.adapter_dir)
 
     t0 = time.perf_counter()
@@ -246,19 +398,21 @@ def main() -> None:
             reasoning_effort=args.reasoning_effort,
             max_transcript_chars=args.max_transcript_chars,
         )
-        decoded = generate_batch(model, tokenizer, enc, args.max_new_tokens)
+        decoded = generate_from_inputs(model, tokenizer, enc, args.max_new_tokens)
 
         for i, raw in zip(batch_idx, decoded):
-            parsed = infer03.parse_channels(raw)
+            parsed = parse_channels(raw)
             df.at[i, "raw_response"] = raw
             df.at[i, "analysis"] = parsed["analysis"]
             df.at[i, "final"] = parsed["final"]
 
         if args.include_base:
             with model.disable_adapter():
-                base_decoded = generate_batch(model, tokenizer, enc, args.max_new_tokens)
+                base_decoded = generate_from_inputs(
+                    model, tokenizer, enc, args.max_new_tokens
+                )
             for i, raw in zip(batch_idx, base_decoded):
-                parsed = infer03.parse_channels(raw)
+                parsed = parse_channels(raw)
                 df.at[i, "base_raw_response"] = raw
                 df.at[i, "base_analysis"] = parsed["analysis"]
                 df.at[i, "base_final"] = parsed["final"]
