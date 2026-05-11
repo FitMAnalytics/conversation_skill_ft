@@ -1,10 +1,19 @@
 """LoRA SFT training for the outbound-sales conversation model (Harmony-aware).
 
-Reads `data/preprocessed.jsonl` (produced by 01_preprocessing) and fine-tunes the
-base model with LoRA in bf16. Each training example is rendered with the native
-GPT-OSS Harmony chat template — reasoning lives in the analysis channel, the
-polished agent response in the final channel — so the analysis channel structure
-is reinforced rather than starved.
+Each training example is rendered with the native GPT-OSS Harmony chat
+template — reasoning lives in the analysis channel, the polished agent
+response in the final channel.
+
+Input fields read from each JSONL row:
+    1. transcript                — current conversation transcript up to the objection
+    2. previous_call_summary     — summary of prior calls with this customer
+    3. current_call_summary      — summary of the current call so far
+    4. customer context          — built via get_customer_context(row) (PLACEHOLDER)
+    5. objection_summary         — summary of the current objection being handled
+
+Targets (assistant turn):
+    - reasoning                  — analysis channel (teacher CoT)
+    - polished_target            — final channel (polished agent response)
 
 Channel-aware loss (per-example per-channel-mean):
   - prefix tokens                 channel_mask 0 (masked, label=-100)
@@ -14,42 +23,30 @@ Channel-aware loss (per-example per-channel-mean):
   - padding                       channel_mask 0
 
 For each example b:
-    loss_a_b = mean(per_token_ce[channel_mask == 1])   # 0 if channel empty
+    loss_a_b = mean(per_token_ce[channel_mask == 1])
     loss_f_b = mean(per_token_ce[channel_mask == 2])
     loss_b   = w_a * loss_a_b + w_f * loss_f_b
 Batch loss = mean(loss_b across examples).
 
-The per-channel-mean formulation neutralizes length asymmetry: analysis is
-typically 3–10× longer than final, so naive per-token loss would be dominated
-by analysis. Equal channel weight by construction.
+Transcript truncation: simple char-based — keep at most
+`max_transcript_chars` (default 12000, ~2000 words) from the END of the
+transcript. If the tokenized prefix+suffix still overflows `max_seq_len`,
+tokens are dropped from the FRONT of the prefix so the suffix (which
+contains the SFT targets) is never lost.
 
-Customer-level 90/10 train/val split (configurable column name) — no leakage:
-a single customer may appear across multiple calls, so call- or row-level
-splits leak context.
+Customer-level 90/10 train/val split — no leakage: a single customer may
+appear across multiple calls, so call- or row-level splits leak context.
 
 Launch:
     # Single-GPU LoRA smoke test (no launcher needed):
     python 02_sft_training.py --config 02_train_config.yaml --max-samples 20 --epochs 1
 
-    # Multi-GPU production run via `accelerate launch` (FSDP or DeepSpeed-ZeRO-3,
-    # selected by the accelerate config file). Per cluster policy this is the
-    # only supported multi-GPU launcher — do NOT call `deepspeed` directly.
+    # Multi-GPU production run via `accelerate launch` (FSDP or DeepSpeed-ZeRO-3).
     accelerate launch --config_file <accelerate_config.yaml> 02_sft_training.py \\
         --config 02_train_config.yaml
-    # Or override the config's distributed type at the CLI:
-    accelerate launch --config_file <accelerate_config.yaml> --use_fsdp \\
-        02_sft_training.py --config 02_train_config.yaml
-
-The script does not configure DeepSpeed/FSDP itself — Trainer auto-picks up the
-accelerate plugin from the launch environment. For DeepSpeed-ZeRO-3 specifically
-the accelerate config should set `zero3_init_flag: true` so parameters are
-partitioned at `from_pretrained` time (equivalent to the old HfDeepSpeedConfig
-hook); without that flag every rank tries to materialize the full model on
-cuda:0 and OOMs.
 """
 
 import argparse
-import importlib.util
 import json
 import logging
 import os
@@ -70,17 +67,11 @@ from transformers import (
     TrainingArguments,
 )
 
-# Reuse Stage 01 helpers (system prompt, turn parsing, windowing).
-_spec = importlib.util.spec_from_file_location(
-    "preproc01", str(Path(__file__).resolve().parent / "01_preprocessing.py")
-)
-preproc01 = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(preproc01)
-
 DEFAULT_MODEL_DIR = "/path/to/gpt-oss-120b"
 DEFAULT_DATA_FILE = "data/preprocessed.jsonl"
 DEFAULT_OUTPUT_DIR = "checkpoints"
 DEFAULT_MAX_SEQ_LEN = 4096
+DEFAULT_MAX_TRANSCRIPT_CHARS = 12000  # ~2000 words; tail of the transcript
 
 # Harmony framing — verified against gpt_oss_inspection.ipynb cell 2.
 ANALYSIS_HEADER = "<|channel|>analysis<|message|>"
@@ -88,6 +79,62 @@ FINAL_HEADER = "<|channel|>final<|message|>"
 ANALYSIS_END = "<|end|>"
 ASSISTANT_RESTART = "<|start|>assistant"
 FINAL_END = "<|return|>"
+
+
+# ============================================================================
+# PROMPT TEMPLATES — edit these to change what the model sees at train/inference
+# ============================================================================
+
+SYSTEM_CONTENT = """You are an outbound sales agent on the TSE channel. You will be given
+the customer's context, a summary of prior calls with this customer, a summary of how the
+current call has gone so far, the current objection the customer just raised, and the
+verbatim transcript of the current call up to the objection.
+
+Reason about how to handle this objection in the analysis channel, then produce the agent
+turn you would say next in the final channel. In analysis, reason in first person present
+tense as the agent would think silently between hearing the objection and choosing what to
+say — flowing natural prose, no bullets, no headers, no enumerated steps. Reason as much as
+the case warrants and no more. In the final channel, produce ONE natural agent turn — what
+you would actually say next, in the words you would speak."""
+
+USER_TMPL = """CUSTOMER CONTEXT:
+{customer_context}
+
+PREVIOUS CALL SUMMARY:
+{previous_call_summary}
+
+CURRENT CALL SUMMARY:
+{current_call_summary}
+
+CURRENT OBJECTION:
+{objection_summary}
+
+CURRENT TRANSCRIPT (up to objection):
+{transcript}"""
+
+
+def get_customer_context(row: dict) -> str:
+    """PLACEHOLDER — return the customer-context text block for a training row.
+
+    Customize this to match your data schema. For example, if the row has
+    columns like 'sic4_industry', 'rev_tier', 'emp_ct':
+
+        return (
+            f"Industry (SIC4): {row.get('sic4_industry', 'unknown')}\\n"
+            f"Revenue tier:    {row.get('rev_tier', 'unknown')}\\n"
+            f"Employee count:  {row.get('emp_ct', 'unknown')}"
+        )
+
+    Or, if you've already pre-rendered a text block into a single column:
+
+        return row.get("customer_context", "")
+
+    The default below just reads a 'customer_context' field if present and
+    falls back to an empty string, so an unmodified script won't crash on
+    a missing schema — but YOU SHOULD REPLACE THIS with your real fetcher.
+    """
+    # TODO(Yi): replace with the real customer-context construction for your dataset
+    return row.get("customer_context", "") or ""
 
 
 # ============================================================================
@@ -106,15 +153,15 @@ class TrainConfig:
     # data field names (must match the JSONL produced by your preproc glue step)
     customer_id_field: str = "customer_id"  # falls back to "cust_id" if missing
     transcript_field: str = "transcript"
-    history_summary_field: str = "history_summary"
-    reasoning_field: str = "reasoning"
-    polished_target_field: str = "polished_target"
-    context_field: str = "context"
-    substantial_field: str = "is_substantial"
+    previous_call_summary_field: str = "previous_call_summary"
+    current_call_summary_field: str = "current_call_summary"
+    objection_summary_field: str = "objection_summary"
+    reasoning_field: str = "reasoning"           # analysis-channel target (teacher CoT)
+    polished_target_field: str = "polished_target"  # final-channel target
 
     # tokenization
     max_seq_len: int = DEFAULT_MAX_SEQ_LEN
-    window_size: int = 50  # max transcript turns; 0 disables windowing
+    max_transcript_chars: int = DEFAULT_MAX_TRANSCRIPT_CHARS  # tail-of-transcript cap
     max_samples: int | None = None  # smoke-test cap
 
     # split
@@ -170,7 +217,6 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--config", default=None,
                    help="Path to YAML config (TrainConfig fields). CLI flags override.")
-    # Common per-run overrides — leave None so we know whether the user passed them.
     p.add_argument("--input", default=None)
     p.add_argument("--model-dir", default=None)
     p.add_argument("--output-dir", default=None)
@@ -180,10 +226,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--final-weight", type=float, default=None,
                    help="Weight on final-channel mean loss")
     p.add_argument("--max-samples", type=int, default=None,
-                   help="Smoke test: use only first N substantial examples (before split)")
+                   help="Smoke test: use only first N examples (before split)")
     p.add_argument("--max-seq-len", type=int, default=None)
-    p.add_argument("--window-size", type=int, default=None,
-                   help="Keep only the last N turns of transcript. Pass 0 to disable windowing.")
+    p.add_argument("--max-transcript-chars", type=int, default=None,
+                   help="Keep at most this many characters from the END of the transcript.")
     # Absorb the local-rank flag forwarded by accelerate / torchrun.
     p.add_argument("--local_rank", type=int, default=-1, help=argparse.SUPPRESS)
     return p.parse_args()
@@ -201,7 +247,7 @@ def resolve_config(args: argparse.Namespace) -> TrainConfig:
         "w_final": args.final_weight,
         "max_samples": args.max_samples,
         "max_seq_len": args.max_seq_len,
-        "window_size": args.window_size,
+        "max_transcript_chars": args.max_transcript_chars,
     }
     for k, v in overrides.items():
         if v is not None:
@@ -210,12 +256,7 @@ def resolve_config(args: argparse.Namespace) -> TrainConfig:
 
 
 def is_distributed_launch() -> bool:
-    """True when launched under `accelerate launch` (FSDP or DeepSpeed) or `torchrun`.
-
-    Checked via env vars set by the launcher: LOCAL_RANK is set by torchrun and by
-    accelerate in any multi-process config; the ACCELERATE_USE_* flags catch the
-    single-process accelerate case where we still want to skip device_map.
-    """
+    """True when launched under `accelerate launch` (FSDP or DeepSpeed) or `torchrun`."""
     if "LOCAL_RANK" in os.environ:
         return True
     return any(os.environ.get(k, "").lower() == "true"
@@ -226,66 +267,65 @@ def is_distributed_launch() -> bool:
 # TOKENIZATION (manual span concat — channel boundaries known by construction)
 # ============================================================================
 
-def render_prefix(tokenizer, transcript: str, history_summary: str, context: str = "") -> str:
+def trim_transcript(transcript: str, max_chars: int) -> tuple[str, bool]:
+    """Keep at most `max_chars` characters from the END of the transcript.
+
+    Returns (trimmed, was_truncated). If trimming would cut mid-line, the
+    leading partial line is dropped so the kept text starts at a clean newline.
+    """
+    if len(transcript) <= max_chars:
+        return transcript, False
+    trimmed = transcript[-max_chars:]
+    # Drop the leading partial line if there's a newline within the kept slice,
+    # so the prompt sees clean turns.
+    nl = trimmed.find("\n")
+    if 0 <= nl < len(trimmed) - 1:
+        trimmed = trimmed[nl + 1:]
+    return trimmed, True
+
+
+def build_prefix_text(tokenizer, row: dict, cfg: "TrainConfig",
+                      truncate_counter: list[int]) -> str:
     """Render system + user message ending at the assistant generation prompt."""
-    system_content = preproc01.build_agent_system_content(history_summary, context=context)
+    transcript, was_truncated = trim_transcript(
+        row[cfg.transcript_field], cfg.max_transcript_chars
+    )
+    if was_truncated:
+        truncate_counter[0] += 1
+
+    user_text = USER_TMPL.format(
+        customer_context=get_customer_context(row),
+        previous_call_summary=row[cfg.previous_call_summary_field],
+        current_call_summary=row[cfg.current_call_summary_field],
+        objection_summary=row[cfg.objection_summary_field],
+        transcript=transcript,
+    )
     messages = [
-        {"role": "system", "content": system_content},
-        {"role": "user", "content": f"transcript:\n{transcript}"},
+        {"role": "system", "content": SYSTEM_CONTENT},
+        {"role": "user", "content": user_text},
     ]
     return tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
 
 
-def fit_prefix_to_budget(tokenizer, transcript: str, history_summary: str, context: str,
-                         suffix_len: int, max_seq_len: int,
-                         window_size: int | None) -> tuple[list[int], int]:
-    """Window then drop oldest turns until prefix + suffix fits in max_seq_len.
-
-    The system prompt and context block are NEVER truncated — only the transcript
-    loses its earliest turns. Returns (prefix_ids, n_turns_kept).
-    """
-    turns = preproc01.parse_turns(transcript)
-    if window_size is not None and len(turns) > window_size:
-        turns = turns[-window_size:]
-
-    while True:
-        windowed = preproc01.render_turns(turns) if turns else ""
-        prefix_text = render_prefix(tokenizer, windowed, history_summary, context)
-        prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
-        if len(prefix_ids) + suffix_len <= max_seq_len:
-            return prefix_ids, len(turns)
-        if not turns:
-            return prefix_ids, 0
-        turns = turns[1:]
-
-
-def encode_with_spans(tokenizer, transcript: str, history_summary: str,
-                      reasoning: str, polished_target: str, context: str,
-                      max_seq_len: int, window_size: int | None) -> dict:
-    """Tokenize a Harmony-rendered example and return the assistant-turn segments.
-
-    Each segment is tagged with its kind ∈ {analysis, final, framing} so the caller
-    can build a per-token channel_mask without re-parsing the tokenized output.
-    """
+def encode_with_spans(tokenizer, row: dict, cfg: "TrainConfig",
+                      truncate_counter: list[int]) -> dict:
+    """Tokenize one example into prefix + tagged assistant-turn segments."""
     def enc(s: str) -> list[int]:
         return tokenizer.encode(s, add_special_tokens=False)
 
     a_header = enc(ANALYSIS_HEADER)
-    a_content = enc(reasoning)
+    a_content = enc(row[cfg.reasoning_field])
     a_end = enc(ANALYSIS_END)
     restart = enc(ASSISTANT_RESTART)
     f_header = enc(FINAL_HEADER)
-    f_content = enc(polished_target)
+    f_content = enc(row[cfg.polished_target_field])
     f_end = enc(FINAL_END)
-    suffix_len = sum(len(s) for s in (a_header, a_content, a_end, restart, f_header, f_content, f_end))
 
-    prefix_ids, n_turns_kept = fit_prefix_to_budget(
-        tokenizer, transcript, history_summary, context, suffix_len, max_seq_len, window_size
-    )
+    prefix_text = build_prefix_text(tokenizer, row, cfg, truncate_counter)
+    prefix_ids = tokenizer.encode(prefix_text, add_special_tokens=False)
 
     return {
         "prefix_ids": prefix_ids,
-        "n_turns_kept": n_turns_kept,
         "segments": [
             ("a_header", a_header, "framing"),
             ("a_content", a_content, "analysis"),
@@ -350,38 +390,15 @@ def customer_level_split(
 def build_dataset(examples: list[dict], tokenizer, cfg: TrainConfig) -> Dataset:
     """Tokenize all examples and pack into a HF Dataset with channel_mask."""
     input_ids_list, labels_list, attention_list, channel_mask_list = [], [], [], []
-    n_window_dropped = 0
-    n_budget_dropped = 0
-    n_overflow = 0
+    truncate_counter = [0]
+    n_prefix_trimmed = 0
 
     for ex in examples:
-        original_n_turns = len(preproc01.parse_turns(ex[cfg.transcript_field]))
-        encoded = encode_with_spans(
-            tokenizer,
-            transcript=ex[cfg.transcript_field],
-            history_summary=ex[cfg.history_summary_field],
-            reasoning=ex[cfg.reasoning_field],
-            polished_target=ex[cfg.polished_target_field],
-            context=ex.get(cfg.context_field, ""),
-            max_seq_len=cfg.max_seq_len,
-            window_size=cfg.window_size if cfg.window_size > 0 else None,
-        )
+        encoded = encode_with_spans(tokenizer, ex, cfg, truncate_counter)
         prefix_ids = encoded["prefix_ids"]
         segments = encoded["segments"]
-        n_kept = encoded["n_turns_kept"]
-        suffix_len = sum(len(s[1]) for s in segments)
 
-        if cfg.window_size > 0 and original_n_turns > cfg.window_size:
-            n_window_dropped += 1
-        post_window = (
-            min(original_n_turns, cfg.window_size) if cfg.window_size > 0 else original_n_turns
-        )
-        if n_kept < post_window:
-            n_budget_dropped += 1
-        if len(prefix_ids) + suffix_len > cfg.max_seq_len:
-            n_overflow += 1
-
-        # Assemble token IDs and channel_mask.
+        # Assemble token IDs and channel_mask in lockstep.
         full_ids = list(prefix_ids)
         channel_mask = [0] * len(prefix_ids)
         for _name, ids, kind in segments:
@@ -393,13 +410,16 @@ def build_dataset(examples: list[dict], tokenizer, cfg: TrainConfig) -> Dataset:
             else:  # framing — base model already knows Harmony, don't train on it
                 channel_mask.extend([0] * len(ids))
 
-        # Labels mirror input_ids, masked to -100 where channel_mask == 0.
+        # If overflow, drop tokens from the FRONT of the prefix so the suffix
+        # (containing the SFT targets) is never lost.
+        if len(full_ids) > cfg.max_seq_len:
+            excess = len(full_ids) - cfg.max_seq_len
+            full_ids = full_ids[excess:]
+            channel_mask = channel_mask[excess:]
+            n_prefix_trimmed += 1
+
         labels = [(tid if cm != 0 else -100) for tid, cm in zip(full_ids, channel_mask)]
 
-        if len(full_ids) > cfg.max_seq_len:
-            full_ids = full_ids[:cfg.max_seq_len]
-            labels = labels[:cfg.max_seq_len]
-            channel_mask = channel_mask[:cfg.max_seq_len]
         attention = [1] * len(full_ids)
         pad = cfg.max_seq_len - len(full_ids)
         if pad > 0:
@@ -414,12 +434,15 @@ def build_dataset(examples: list[dict], tokenizer, cfg: TrainConfig) -> Dataset:
         attention_list.append(attention)
         channel_mask_list.append(channel_mask)
 
-    logging.info("Examples windowed (>%s turns): %d", cfg.window_size, n_window_dropped)
-    logging.info("Examples that lost extra turns to token budget: %d", n_budget_dropped)
-    if n_overflow:
+    logging.info(
+        "Transcript char-trimmed: %d / %d examples (max_transcript_chars=%d)",
+        truncate_counter[0], len(examples), cfg.max_transcript_chars,
+    )
+    if n_prefix_trimmed:
         logging.warning(
-            "Examples overflowing max_seq_len even with empty transcript: %d "
-            "(system+context+suffix alone don't fit — increase max_seq_len)", n_overflow,
+            "Token-overflow prefix-trim: %d examples lost prefix tokens to fit "
+            "max_seq_len=%d. Lower max_transcript_chars or raise max_seq_len.",
+            n_prefix_trimmed, cfg.max_seq_len,
         )
     return Dataset.from_dict({
         "input_ids": input_ids_list,
@@ -458,13 +481,11 @@ class ChannelMeanLossTrainer(Trainer):
         outputs = model(**inputs)
         logits = outputs.logits  # (B, T, V)
 
-        # Shift for next-token prediction.
         shift_logits = logits[..., :-1, :].contiguous()
         shift_labels = labels[..., 1:].contiguous()
         shift_channel = channel_mask[..., 1:].contiguous()
 
         B, Sm1, V = shift_logits.shape
-        # Per-token CE; -100 positions contribute 0 (and we won't read them anyway).
         per_token = F.cross_entropy(
             shift_logits.view(-1, V),
             shift_labels.view(-1),
@@ -491,8 +512,6 @@ class ChannelMeanLossTrainer(Trainer):
         avg_a = torch.stack(per_example_a).mean()
         avg_f = torch.stack(per_example_f).mean()
 
-        # Track diagnostics. Eval-mode batches accumulate so evaluate() can emit
-        # the average; train-mode just stashes the latest for log() to inject.
         if model.training:
             self._last_loss_a = float(avg_a.detach().float().item())
             self._last_loss_f = float(avg_f.detach().float().item())
@@ -504,7 +523,6 @@ class ChannelMeanLossTrainer(Trainer):
         return (total, outputs) if return_outputs else total
 
     def log(self, logs: dict, *args, **kwargs):
-        # Inject train-step per-channel losses. Skip eval logs (handled in evaluate).
         if "loss" in logs and "eval_loss" not in logs:
             if self._last_loss_a is not None:
                 logs["loss_a"] = self._last_loss_a
@@ -527,7 +545,6 @@ class ChannelMeanLossTrainer(Trainer):
                 f"{metric_key_prefix}_loss_f": self._eval_loss_f_sum / self._eval_count,
             }
             metrics.update(extras)
-            # Re-log so tensorboard sees the per-channel eval metrics.
             self.log(extras)
         return metrics
 
@@ -577,11 +594,8 @@ def main() -> None:
     raw = []
     with open(cfg.input, "r", encoding="utf-8") as f:
         for line in f:
-            row = json.loads(line)
-            if not row.get(cfg.substantial_field, True):
-                continue
-            raw.append(row)
-    logging.info("Loaded %d substantial examples from %s", len(raw), cfg.input)
+            raw.append(json.loads(line))
+    logging.info("Loaded %d examples from %s", len(raw), cfg.input)
 
     if cfg.max_samples is not None:
         raw = raw[:cfg.max_samples]
@@ -598,7 +612,6 @@ def main() -> None:
         len(train_ds), len(val_ds), cfg.max_seq_len,
     )
 
-    # Sanity print on train example 0.
     first = train_ds[0]
     cm = torch.tensor(first["channel_mask"])
     logging.info(
@@ -658,7 +671,6 @@ def main() -> None:
         eval_dataset=val_ds,
     )
 
-    # Snapshot resolved config for reproducibility.
     if trainer.is_world_process_zero():
         with open(output_dir / "train_config.yaml", "w", encoding="utf-8") as f:
             yaml.safe_dump(asdict(cfg), f, sort_keys=False)

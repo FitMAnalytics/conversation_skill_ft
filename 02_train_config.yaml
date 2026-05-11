@@ -8,18 +8,21 @@ output_dir: checkpoints
 
 # ---- data field names in the JSONL ----
 # Falls back to "cust_id" if customer_id_field is missing on a row.
+# Customer-context construction is via get_customer_context(row) in the script
+# (PLACEHOLDER — edit there to match your schema).
 customer_id_field: customer_id
 transcript_field: transcript
-history_summary_field: history_summary
-reasoning_field: reasoning            # Stage 5 teacher CoT (analysis channel target)
-polished_target_field: polished_target  # Stage 2 polished response (final channel target)
-context_field: context
-substantial_field: is_substantial
+previous_call_summary_field: previous_call_summary
+current_call_summary_field: current_call_summary
+objection_summary_field: objection_summary
+reasoning_field: reasoning            # analysis-channel target (teacher CoT)
+polished_target_field: polished_target  # final-channel target
 
 # ---- tokenization ----
-# Compute 95th/99th percentile token count from preprocessed data, then set.
+# Char-based transcript trim: keep at most this many characters from the END
+# of the transcript (~2000 words at 6 chars/word).
+max_transcript_chars: 12000
 max_seq_len: 4096
-window_size: 50      # max transcript turns; 0 disables windowing
 max_samples: null    # smoke-test cap; null = use all
 
 # ---- split ----
@@ -29,7 +32,6 @@ split_seed: 42
 # ---- channel loss weights ----
 # Per-example per-channel-mean formulation:
 #   loss = w_analysis * mean(ce[analysis]) + w_final * mean(ce[final])
-# Equal weight by default — adjust only if per-channel val loss reveals imbalance.
 w_analysis: 1.0
 w_final: 1.0
 
