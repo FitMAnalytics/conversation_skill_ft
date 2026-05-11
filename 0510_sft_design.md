@@ -440,6 +440,96 @@ a real run).
 
 ---
 
+## Part F — Alternative: no-teacher-CoT SFT (`02_sft_training_nocot_0511.py`)
+
+A second training entry-point that trains the final-channel response WITHOUT
+supervising any analysis-channel content. Lives alongside the main script,
+not a replacement.
+
+### F.1 Motivation
+
+We don't yet have trusted teacher CoT (Stage 5 prompts are still being
+iterated, no best-of-N rejection sampling yet). Rather than block on that,
+this variant lets us start training the polished response immediately and
+observe a basic question: does GPT-OSS's base reasoning prior survive an
+SFT that ignores the analysis channel? If reasoning survives, the resulting
+adapter is also a credible baseline against the future CoT-supervised
+adapter — same data, same final-channel target, different reasoning regime.
+
+### F.2 What changes vs the main script
+
+| Concern | Main script (`02_sft_training.py`) | No-CoT variant (`02_sft_training_nocot_0511.py`) |
+|---|---|---|
+| Reads `reasoning_field` | Yes — feeds it as analysis-channel content | No — field is not read |
+| Analysis-channel span at train time | `<\|channel\|>analysis<\|message\|>` + teacher CoT + `<\|end\|>` | `<\|channel\|>analysis<\|message\|>` + `<\|end\|>` (empty between them) |
+| Final-channel span at train time | unchanged | unchanged |
+| Channel-mask values | `{0, 1, 2}` (framing, analysis, final) | `{0, 2}` only — no analysis tokens are ever tagged |
+| Loss formula | `mean_b ( w_a · mean(ce[mask==1]) + w_f · mean(ce[mask==2]) )` | `mean_b ( mean(ce[mask==2]) )` |
+| Trainer class | `ChannelMeanLossTrainer` | `FinalOnlyMeanLossTrainer` (drops `w_a`, `w_f`, `loss_a` tracking) |
+| TensorBoard scalars | `loss`, `loss_a`, `loss_f`, `eval_loss`, `eval_loss_a`, `eval_loss_f` | `loss`, `loss_f`, `eval_loss`, `eval_loss_f` |
+| CLI flags | `--analysis-weight`, `--final-weight` exposed | both removed |
+| Default `output_dir` | `checkpoints` | `checkpoints_nocot` |
+| YAML config | `02_train_config.yaml` | `02_train_config_nocot.yaml` (no `reasoning_field`, `w_analysis`, `w_final`) |
+
+### F.3 Known limitations
+
+1. **Reasoning at inference is decorative, not load-bearing.** Because the
+   analysis span during training is empty, the final-channel CE loss never
+   backprops through substantive analysis tokens. The model never learns to
+   *condition* its final response on analysis content. The base reasoning
+   prior will likely still emit content in the analysis channel at inference
+   — but the final-channel prediction was never trained to attend to it
+   usefully. Reasoning becomes a visual artifact rather than a contributor
+   to response quality. To get load-bearing reasoning, we need teacher CoT
+   in the analysis span (i.e. the main script).
+2. **The "small reward for analysis >2000 characters" proposed during
+   design was dropped.** In teacher-forced SFT the analysis content is
+   fixed by the training data (here, empty). A length-based term has no
+   degree of freedom to act on — it would be either a constant per example
+   or zero, with no learning signal on the model's analysis-generation
+   distribution. Length-encouraged reasoning requires the model to *sample*
+   its own analysis and receive a reward, which is an RL stage (PPO/GRPO),
+   not an SFT modification. Out of scope here.
+3. **Train/inference distribution mismatch on the final channel.** During
+   training the final channel was conditioned on an empty analysis span; at
+   inference it will be conditioned on whatever the base prior generates.
+   The model's internal expectation of "what came before final" doesn't
+   match what shows up at inference. Likely minor in practice but worth
+   noting when comparing this variant's val_loss_f to the main script's.
+
+### F.4 How to run it
+
+Single-GPU smoke test (matches Part E.4 form):
+
+```bash
+python 02_sft_training_nocot_0511.py --config 02_train_config_nocot.yaml \
+    --max-samples 20 --epochs 1 --output-dir checkpoints_nocot_smoketest
+```
+
+Multi-GPU production run via accelerate:
+
+```bash
+nohup accelerate launch --config_file <fsdp_config.yaml> \
+    02_sft_training_nocot_0511.py --config 02_train_config_nocot.yaml \
+    > train_nocot.log 2>&1 & disown
+```
+
+For the 8×H100 / 2-faulty cluster:
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5 nohup accelerate launch \
+    --config_file <fsdp_config.yaml> --num_processes 6 \
+    02_sft_training_nocot_0511.py --config 02_train_config_nocot.yaml \
+    > train_nocot.log 2>&1 & disown
+```
+
+Sanity check after the first run: `train_ds[0]` should report
+`analysis=0, final>0` in the startup log (instead of the main script's
+`analysis>0, final>0`). That's the structural confirmation that no
+analysis tokens are being supervised.
+
+---
+
 ## Part D — Open Questions Deferred
 
 1. **Best-of-N N value and similarity threshold.** Decide when real teacher
