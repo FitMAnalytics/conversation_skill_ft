@@ -1,0 +1,68 @@
+# TSE SFT training run config. Loaded by `02_sft_training.py --config <path>`.
+# CLI flags override individual values. Yi: update paths and field names.
+
+# ---- paths ----
+model_dir: /path/to/gpt-oss-120b
+input: data/preprocessed.jsonl
+output_dir: checkpoints
+
+# ---- data field names in the JSONL ----
+# Falls back to "cust_id" if customer_id_field is missing on a row.
+customer_id_field: customer_id
+transcript_field: transcript
+history_summary_field: history_summary
+reasoning_field: reasoning            # Stage 5 teacher CoT (analysis channel target)
+polished_target_field: polished_target  # Stage 2 polished response (final channel target)
+context_field: context
+substantial_field: is_substantial
+
+# ---- tokenization ----
+# Compute 95th/99th percentile token count from preprocessed data, then set.
+max_seq_len: 4096
+window_size: 50      # max transcript turns; 0 disables windowing
+max_samples: null    # smoke-test cap; null = use all
+
+# ---- split ----
+val_fraction: 0.10
+split_seed: 42
+
+# ---- channel loss weights ----
+# Per-example per-channel-mean formulation:
+#   loss = w_analysis * mean(ce[analysis]) + w_final * mean(ce[final])
+# Equal weight by default — adjust only if per-channel val loss reveals imbalance.
+w_analysis: 1.0
+w_final: 1.0
+
+# ---- LoRA ----
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.0
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+
+# ---- optimization ----
+learning_rate: 1.0e-5
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+weight_decay: 0.0
+per_device_train_batch_size: 1
+per_device_eval_batch_size: 1
+gradient_accumulation_steps: 8        # effective batch = 1 * 8 * num_gpus
+num_train_epochs: 3
+gradient_checkpointing: true
+max_grad_norm: 1.0
+optim: adamw_torch_fused
+
+# ---- checkpointing & logging ----
+save_steps: 30
+save_total_limit: 10
+eval_steps: 30
+logging_steps: 5
+report_to: tensorboard
+
+# ---- misc ----
+seed: 42
+bf16: true
