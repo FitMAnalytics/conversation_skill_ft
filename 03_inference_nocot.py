@@ -332,17 +332,53 @@ def precompute_prefix_cache(model, prefix_ids: list[int]) -> DynamicCache:
     return cache
 
 
+def _cache_num_layers(cache) -> int:
+    """Number of populated layers in a DynamicCache, across transformers versions."""
+    if hasattr(cache, "key_cache"):
+        return len(cache.key_cache)
+    if hasattr(cache, "layers"):
+        return len(cache.layers)
+    # Last resort: probe via __getitem__ until it raises.
+    n = 0
+    while True:
+        try:
+            _ = cache[n]
+        except (IndexError, KeyError, AttributeError):
+            return n
+        n += 1
+
+
+def _cache_get_layer_kv(cache, layer_idx: int):
+    """Return (keys, values) tensors for one cache layer, across versions."""
+    if hasattr(cache, "key_cache") and hasattr(cache, "value_cache"):
+        return cache.key_cache[layer_idx], cache.value_cache[layer_idx]
+    if hasattr(cache, "layers"):
+        layer = cache.layers[layer_idx]
+        if hasattr(layer, "keys") and hasattr(layer, "values"):
+            return layer.keys, layer.values
+        if hasattr(layer, "key_cache") and hasattr(layer, "value_cache"):
+            return layer.key_cache, layer.value_cache
+    # __getitem__ fallback (DynamicCache implements it as (keys, values) tuple).
+    return cache[layer_idx]
+
+
 def expand_prefix_cache(cache: DynamicCache, batch_size: int) -> DynamicCache:
     """Replicate a batch=1 cache to batch=B with contiguous copies.
 
     `.contiguous()` after `.expand()` materializes the broadcast so the
     subsequent `generate` mutates a fresh tensor instead of aliasing the
-    original cache.
+    original cache. Built via the public `update(...)` API so it works
+    across the transformers DynamicCache API changes (some versions removed
+    the direct `key_cache` / `value_cache` list attributes).
     """
     new = DynamicCache()
-    for k, v in zip(cache.key_cache, cache.value_cache):
-        new.key_cache.append(k.expand(batch_size, -1, -1, -1).contiguous())
-        new.value_cache.append(v.expand(batch_size, -1, -1, -1).contiguous())
+    for layer_idx in range(_cache_num_layers(cache)):
+        k, v = _cache_get_layer_kv(cache, layer_idx)
+        new.update(
+            k.expand(batch_size, -1, -1, -1).contiguous(),
+            v.expand(batch_size, -1, -1, -1).contiguous(),
+            layer_idx,
+        )
     return new
 
 
