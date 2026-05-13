@@ -355,15 +355,68 @@ class PrefixCacheState:
     enabled: bool = False
 
 
+def _log_lcp_debug(tokenizer, sample_texts: list[str],
+                   token_lists: list[list[int]], lcp: int) -> None:
+    """Print two sample prompts side-by-side and locate where they diverge.
+
+    Helps explain a smaller-than-expected LCP — usually a per-row field
+    leaking into the prefix (e.g. customer_context) or a template-injected
+    dynamic value (e.g. current date/time).
+    """
+    if len(token_lists) < 2:
+        logging.info("LCP debug: probe batch has only %d rows — nothing to diff.",
+                     len(token_lists))
+        return
+
+    s0, s1 = sample_texts[0], sample_texts[1]
+    char_div = next(
+        (i for i in range(min(len(s0), len(s1))) if s0[i] != s1[i]),
+        min(len(s0), len(s1)),
+    )
+
+    logging.info("=" * 80)
+    logging.info("LCP DEBUG  token-LCP=%d  (row0 has %d toks, row1 has %d toks)",
+                 lcp, len(token_lists[0]), len(token_lists[1]))
+    logging.info("           char divergence at index %d", char_div)
+    logging.info("-" * 80)
+    logging.info("ROW 0 — rendered prompt (first 800 chars):")
+    logging.info("%s", s0[:800])
+    logging.info("-" * 80)
+    logging.info("ROW 1 — rendered prompt (first 800 chars):")
+    logging.info("%s", s1[:800])
+    logging.info("-" * 80)
+
+    pre = max(0, char_div - 80)
+    post = char_div + 200
+    logging.info("DIVERGE near char %d:", char_div)
+    logging.info("  ROW 0 [%d:%d] = %r", pre, post, s0[pre:post])
+    logging.info("  ROW 1 [%d:%d] = %r", pre, post, s1[pre:post])
+
+    a, b = token_lists[0], token_lists[1]
+    lo = max(0, lcp - 5)
+    hi_a, hi_b = min(len(a), lcp + 10), min(len(b), lcp + 10)
+    logging.info("Tokens around divergence (5 before, up to 10 after):")
+    logging.info("  ROW 0 tokens[%d:%d] = %s -> %r",
+                 lo, hi_a, a[lo:hi_a],
+                 tokenizer.decode(a[lo:hi_a], skip_special_tokens=False))
+    logging.info("  ROW 1 tokens[%d:%d] = %s -> %r",
+                 lo, hi_b, b[lo:hi_b],
+                 tokenizer.decode(b[lo:hi_b], skip_special_tokens=False))
+    logging.info("=" * 80)
+
+
 def setup_prefix_cache(model, tokenizer, sample_texts: list[str],
                        include_base: bool,
-                       min_tokens: int = MIN_PREFIX_CACHE_TOKENS) -> PrefixCacheState:
+                       min_tokens: int = MIN_PREFIX_CACHE_TOKENS,
+                       debug_lcp: bool = False) -> PrefixCacheState:
     """Detect shared prefix from rendered prompts and precompute KV caches."""
     state = PrefixCacheState()
     token_lists = [tokenizer.encode(t, add_special_tokens=False) for t in sample_texts]
 
     if len(token_lists) >= 2:
         lcp = find_lcp_tokens(token_lists)
+        if debug_lcp:
+            _log_lcp_debug(tokenizer, sample_texts, token_lists, lcp)
     elif len(token_lists) == 1:
         # Single sample: probe with a system-only chat-template render and use
         # the LCP between that and the sample's tokens. The system block is the
@@ -562,6 +615,9 @@ def parse_args() -> argparse.Namespace:
                    help="Disable the shared-prefix DynamicCache optimization. "
                         "Slower; use if your transformers version mishandles "
                         "`past_key_values` with `generate`.")
+    p.add_argument("--debug-lcp", action="store_true",
+                   help="Print two probe-batch prompts and the exact char/token "
+                        "where they diverge, to diagnose a smaller-than-expected LCP.")
     return p.parse_args()
 
 
@@ -602,7 +658,9 @@ def main() -> None:
             max_transcript_chars=args.max_transcript_chars,
         )
         cache_state = setup_prefix_cache(
-            model, tokenizer, probe_texts, include_base=args.include_base,
+            model, tokenizer, probe_texts,
+            include_base=args.include_base,
+            debug_lcp=args.debug_lcp,
         )
 
     t0 = time.perf_counter()
