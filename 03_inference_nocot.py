@@ -405,17 +405,28 @@ def _log_lcp_debug(tokenizer, sample_texts: list[str],
     logging.info("=" * 80)
 
 
-def _single_sample_lcp(tokenizer, sample_text: str, sample_ids: list[int]
+def _single_sample_lcp(tokenizer, sample_ids: list[int], reasoning_effort: str
                        ) -> tuple[int, str, list[int]]:
     """Probe-with-1-row helper: compare against a system-only chat-template render.
+
+    Critical: pass the SAME `reasoning_effort` the row used, otherwise the
+    template's default (medium) leaks into the probe and the LCP cuts off
+    inside the system block at the `Reasoning: <effort>` line.
 
     Returns (lcp_token_len, sys_text, sys_ids). On failure returns (0, "", []).
     """
     try:
-        sys_text = tokenizer.apply_chat_template(
-            [{"role": "system", "content": SYSTEM_CONTENT}],
-            add_generation_prompt=False, tokenize=False,
-        )
+        try:
+            sys_text = tokenizer.apply_chat_template(
+                [{"role": "system", "content": SYSTEM_CONTENT}],
+                reasoning_effort=reasoning_effort,
+                add_generation_prompt=False, tokenize=False,
+            )
+        except TypeError:
+            sys_text = tokenizer.apply_chat_template(
+                [{"role": "system", "content": SYSTEM_CONTENT}],
+                add_generation_prompt=False, tokenize=False,
+            )
         sys_ids = tokenizer.encode(sys_text, add_special_tokens=False)
         lcp = 0
         for i in range(min(len(sys_ids), len(sample_ids))):
@@ -428,10 +439,11 @@ def _single_sample_lcp(tokenizer, sample_text: str, sample_ids: list[int]
         return 0, "", []
 
 
-def run_lcp_debug(tokenizer, sample_texts: list[str]) -> None:
+def run_lcp_debug(tokenizer, sample_texts: list[str], reasoning_effort: str) -> None:
     """Always-on debug printer: dumps two probe prompts and where they diverge.
 
-    Works for single-sample probes too (diffs against the system-only render).
+    Works for single-sample probes too (diffs against the system-only render
+    rendered with the SAME `reasoning_effort`).
     """
     logging.info("LCP DEBUG: probe batch has %d sample(s).", len(sample_texts))
     if not sample_texts:
@@ -442,7 +454,7 @@ def run_lcp_debug(tokenizer, sample_texts: list[str]) -> None:
         _log_lcp_debug(tokenizer, sample_texts, token_lists, lcp)
     else:
         lcp, sys_text, sys_ids = _single_sample_lcp(
-            tokenizer, sample_texts[0], token_lists[0]
+            tokenizer, token_lists[0], reasoning_effort
         )
         if not sys_ids:
             return
@@ -456,6 +468,7 @@ def run_lcp_debug(tokenizer, sample_texts: list[str]) -> None:
 
 
 def setup_prefix_cache(model, tokenizer, sample_texts: list[str],
+                       reasoning_effort: str,
                        include_base: bool,
                        min_tokens: int = MIN_PREFIX_CACHE_TOKENS) -> PrefixCacheState:
     """Detect shared prefix from rendered prompts and precompute KV caches."""
@@ -465,7 +478,7 @@ def setup_prefix_cache(model, tokenizer, sample_texts: list[str],
     if len(token_lists) >= 2:
         lcp = find_lcp_tokens(token_lists)
     elif len(token_lists) == 1:
-        lcp, _, _ = _single_sample_lcp(tokenizer, sample_texts[0], token_lists[0])
+        lcp, _, _ = _single_sample_lcp(tokenizer, token_lists[0], reasoning_effort)
     else:
         return state
 
@@ -688,12 +701,13 @@ def main() -> None:
     )
 
     if args.debug_lcp:
-        run_lcp_debug(tokenizer, probe_texts)
+        run_lcp_debug(tokenizer, probe_texts, reasoning_effort=args.reasoning_effort)
 
     cache_state = PrefixCacheState()
     if not args.no_prefix_cache:
         cache_state = setup_prefix_cache(
             model, tokenizer, probe_texts,
+            reasoning_effort=args.reasoning_effort,
             include_base=args.include_base,
         )
 
