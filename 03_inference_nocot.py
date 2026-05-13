@@ -22,6 +22,18 @@ Pipeline per row:
      `final` channels via `parse_channels`.
   5. (Optional) repeat under `model.disable_adapter()` for an A/B against base.
 
+Prefix-cache speedup (default ON):
+  Because `SYSTEM_CONTENT` and `reasoning_effort` are fixed across the whole
+  run, every prompt shares a long token prefix (the rendered system block).
+  We probe the first batch for the longest common token prefix (LCP), run
+  one forward pass on it to populate a `DynamicCache`, then for each batch
+  expand that batch=1 cache to batch=B and call generate with only the
+  per-row suffix tokens. This cuts the prefill cost from O(B * |prefix|)
+  to O(|prefix|) per run. The cache is held in memory throughout the run.
+
+  Override with `--no-prefix-cache` to fall back to the plain path (useful
+  if a transformers version mishandles `past_key_values` with `generate`).
+
 Input DataFrame columns required:
     transcript, previous_call_summary, current_call_summary, objection_summary
 Optional:
@@ -53,12 +65,18 @@ import importlib.util
 import logging
 import re
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import pandas as pd
 import torch
 from peft import PeftModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+try:
+    from transformers import DynamicCache
+except ImportError:
+    from transformers.cache_utils import DynamicCache
 
 _HERE = Path(__file__).resolve().parent
 
@@ -87,6 +105,10 @@ REQUIRED_COLS = (
     "current_call_summary",
     "objection_summary",
 )
+
+# Skip prefix caching if the detected shared prefix is shorter than this.
+# Below this length the bookkeeping cost outweighs the saved prefill.
+MIN_PREFIX_CACHE_TOKENS = 64
 
 
 # ============================================================================
@@ -265,9 +287,9 @@ def _row_customer_context(row: dict) -> str:
     return str(val)
 
 
-def render_batch(tokenizer, rows: list[dict], reasoning_effort: str,
-                 max_transcript_chars: int):
-    """Render a batch of rows as a left-padded BatchEncoding."""
+def texts_for_rows(tokenizer, rows: list[dict], reasoning_effort: str,
+                   max_transcript_chars: int) -> list[str]:
+    """Render each row's prompt as a chat-template string."""
     texts = []
     for r in rows:
         messages = build_messages(
@@ -279,7 +301,185 @@ def render_batch(tokenizer, rows: list[dict], reasoning_effort: str,
             max_transcript_chars=max_transcript_chars,
         )
         texts.append(render_prompt_text(tokenizer, messages, reasoning_effort))
-    return encode_batch(tokenizer, texts)
+    return texts
+
+
+# ============================================================================
+# PREFIX CACHE — share KV across rows with identical system block
+# ============================================================================
+
+def find_lcp_tokens(seqs: list[list[int]]) -> int:
+    """Length of the longest common token prefix across all sequences."""
+    if not seqs:
+        return 0
+    min_len = min(len(s) for s in seqs)
+    first = seqs[0]
+    for i in range(min_len):
+        for s in seqs[1:]:
+            if s[i] != first[i]:
+                return i
+    return min_len
+
+
+def precompute_prefix_cache(model, prefix_ids: list[int]) -> DynamicCache:
+    """One forward pass over the shared prefix → populated batch=1 DynamicCache."""
+    cache = DynamicCache()
+    ids = torch.tensor([prefix_ids], device=model.device, dtype=torch.long)
+    mask = torch.ones_like(ids)
+    with torch.no_grad():
+        model(input_ids=ids, attention_mask=mask,
+              past_key_values=cache, use_cache=True)
+    return cache
+
+
+def expand_prefix_cache(cache: DynamicCache, batch_size: int) -> DynamicCache:
+    """Replicate a batch=1 cache to batch=B with contiguous copies.
+
+    `.contiguous()` after `.expand()` materializes the broadcast so the
+    subsequent `generate` mutates a fresh tensor instead of aliasing the
+    original cache.
+    """
+    new = DynamicCache()
+    for k, v in zip(cache.key_cache, cache.value_cache):
+        new.key_cache.append(k.expand(batch_size, -1, -1, -1).contiguous())
+        new.value_cache.append(v.expand(batch_size, -1, -1, -1).contiguous())
+    return new
+
+
+@dataclass
+class PrefixCacheState:
+    """Holds the shared-prefix KV caches for adapter and (optionally) base."""
+    prefix_ids: list[int] = field(default_factory=list)
+    adapter_cache: DynamicCache | None = None
+    base_cache: DynamicCache | None = None
+    enabled: bool = False
+
+
+def setup_prefix_cache(model, tokenizer, sample_texts: list[str],
+                       include_base: bool,
+                       min_tokens: int = MIN_PREFIX_CACHE_TOKENS) -> PrefixCacheState:
+    """Detect shared prefix from rendered prompts and precompute KV caches."""
+    state = PrefixCacheState()
+    token_lists = [tokenizer.encode(t, add_special_tokens=False) for t in sample_texts]
+
+    if len(token_lists) >= 2:
+        lcp = find_lcp_tokens(token_lists)
+    elif len(token_lists) == 1:
+        # Single sample: probe with a system-only chat-template render and use
+        # the LCP between that and the sample's tokens. The system block is the
+        # only truly-shared chunk we can be sure about a priori.
+        try:
+            sys_text = tokenizer.apply_chat_template(
+                [{"role": "system", "content": SYSTEM_CONTENT}],
+                add_generation_prompt=False, tokenize=False,
+            )
+            sys_ids = tokenizer.encode(sys_text, add_special_tokens=False)
+            lcp = 0
+            for i in range(min(len(sys_ids), len(token_lists[0]))):
+                if sys_ids[i] != token_lists[0][i]:
+                    break
+                lcp = i + 1
+        except Exception as e:  # noqa: BLE001
+            logging.warning("Single-sample prefix probe failed: %s", e)
+            lcp = 0
+    else:
+        return state
+
+    if lcp < min_tokens:
+        logging.info(
+            "Shared-prefix LCP=%d tokens (< %d threshold) — prefix cache disabled.",
+            lcp, min_tokens,
+        )
+        return state
+
+    state.prefix_ids = token_lists[0][:lcp]
+    logging.info("Precomputing prefix-cache KV for %d shared tokens...", lcp)
+    t0 = time.perf_counter()
+    state.adapter_cache = precompute_prefix_cache(model, state.prefix_ids)
+    logging.info("  adapter prefix-cache built in %.2fs", time.perf_counter() - t0)
+    if include_base:
+        t0 = time.perf_counter()
+        with model.disable_adapter():
+            state.base_cache = precompute_prefix_cache(model, state.prefix_ids)
+        logging.info("  base prefix-cache built in %.2fs", time.perf_counter() - t0)
+    state.enabled = True
+    return state
+
+
+def generate_with_prefix_cache(model, tokenizer, prompt_texts: list[str],
+                               state: PrefixCacheState,
+                               max_new_tokens: int,
+                               use_adapter: bool = True) -> list[str] | None:
+    """Greedy batched generate using the precomputed shared-prefix cache.
+
+    Returns one decoded suffix string per row, or None when any row's
+    tokenization does not begin with the cached prefix (caller falls back).
+    """
+    if not state.enabled:
+        return None
+    source = state.adapter_cache if use_adapter else state.base_cache
+    if source is None:
+        return None
+
+    prefix_ids = state.prefix_ids
+    prefix_len = len(prefix_ids)
+    B = len(prompt_texts)
+
+    full_ids_list = [tokenizer.encode(t, add_special_tokens=False) for t in prompt_texts]
+    for i, ids in enumerate(full_ids_list):
+        if ids[:prefix_len] != prefix_ids:
+            logging.warning(
+                "Row %d does not start with cached prefix — disabling cache for this batch.",
+                i,
+            )
+            return None
+
+    suffixes = [ids[prefix_len:] for ids in full_ids_list]
+    max_suffix = max(len(s) for s in suffixes)
+    pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+
+    padded, suffix_attn = [], []
+    for s in suffixes:
+        pad_n = max_suffix - len(s)
+        padded.append([pad_id] * pad_n + s)
+        suffix_attn.append([0] * pad_n + [1] * len(s))
+
+    suffix_ids = torch.tensor(padded, device=model.device, dtype=torch.long)
+    suffix_attn_t = torch.tensor(suffix_attn, device=model.device, dtype=torch.long)
+    # Full attention mask covers cached prefix (all 1s) + per-row suffix mask.
+    prefix_attn = torch.ones((B, prefix_len), device=model.device, dtype=torch.long)
+    full_attn = torch.cat([prefix_attn, suffix_attn_t], dim=1)
+
+    batched_cache = expand_prefix_cache(source, B)
+
+    with torch.no_grad():
+        out = model.generate(
+            input_ids=suffix_ids,
+            attention_mask=full_attn,
+            past_key_values=batched_cache,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=pad_id,
+        )
+
+    # `out` returned by generate when past_key_values is provided contains
+    # [suffix_ids passed in | newly generated tokens] — NOT the cached prefix.
+    new_tokens = out[:, suffix_ids.shape[1]:]
+    return tokenizer.batch_decode(new_tokens, skip_special_tokens=False)
+
+
+def generate_batch_decoded(model, tokenizer, prompt_texts: list[str],
+                           state: PrefixCacheState,
+                           max_new_tokens: int,
+                           use_adapter: bool = True) -> list[str]:
+    """Try cached path; fall back to non-cached encoding+generate on mismatch."""
+    cached = generate_with_prefix_cache(
+        model, tokenizer, prompt_texts, state, max_new_tokens, use_adapter=use_adapter
+    )
+    if cached is not None:
+        return cached
+    enc = encode_batch(tokenizer, prompt_texts)
+    return generate_from_inputs(model, tokenizer, enc, max_new_tokens)
 
 
 # ============================================================================
@@ -356,8 +556,12 @@ def parse_args() -> argparse.Namespace:
                    help="Smoke cap; processes only first N pending rows.")
     p.add_argument("--include-base", action="store_true",
                    help="Also generate with `model.disable_adapter()` for A/B.")
-    p.add_argument("--save-every", type=int, default=10,
-                   help="Persist partial parquet every N batches.")
+    p.add_argument("--save-every", type=int, default=20,
+                   help="Persist partial parquet every N batches (resume-safe).")
+    p.add_argument("--no-prefix-cache", action="store_true",
+                   help="Disable the shared-prefix DynamicCache optimization. "
+                        "Slower; use if your transformers version mishandles "
+                        "`past_key_values` with `generate`.")
     return p.parse_args()
 
 
@@ -387,19 +591,35 @@ def main() -> None:
     model, tokenizer = load_model_with_adapter(args.model_dir, args.adapter_dir)
     logging.info("Model + adapter loaded from %s", args.adapter_dir)
 
+    # Probe the first batch to seed the shared-prefix DynamicCache.
+    cache_state = PrefixCacheState()
+    if not args.no_prefix_cache:
+        probe_idx = pending[: args.batch_size]
+        probe_rows = [df.loc[i].to_dict() for i in probe_idx]
+        probe_texts = texts_for_rows(
+            tokenizer, probe_rows,
+            reasoning_effort=args.reasoning_effort,
+            max_transcript_chars=args.max_transcript_chars,
+        )
+        cache_state = setup_prefix_cache(
+            model, tokenizer, probe_texts, include_base=args.include_base,
+        )
+
     t0 = time.perf_counter()
     n_batches = 0
     for start in range(0, len(pending), args.batch_size):
         batch_idx = pending[start: start + args.batch_size]
         rows = [df.loc[i].to_dict() for i in batch_idx]
-
-        enc = render_batch(
+        prompt_texts = texts_for_rows(
             tokenizer, rows,
             reasoning_effort=args.reasoning_effort,
             max_transcript_chars=args.max_transcript_chars,
         )
-        decoded = generate_from_inputs(model, tokenizer, enc, args.max_new_tokens)
 
+        decoded = generate_batch_decoded(
+            model, tokenizer, prompt_texts, cache_state,
+            max_new_tokens=args.max_new_tokens, use_adapter=True,
+        )
         for i, raw in zip(batch_idx, decoded):
             parsed = parse_channels(raw)
             df.at[i, "raw_response"] = raw
@@ -408,8 +628,9 @@ def main() -> None:
 
         if args.include_base:
             with model.disable_adapter():
-                base_decoded = generate_from_inputs(
-                    model, tokenizer, enc, args.max_new_tokens
+                base_decoded = generate_batch_decoded(
+                    model, tokenizer, prompt_texts, cache_state,
+                    max_new_tokens=args.max_new_tokens, use_adapter=False,
                 )
             for i, raw in zip(batch_idx, base_decoded):
                 parsed = parse_channels(raw)
@@ -425,7 +646,8 @@ def main() -> None:
 
         if n_batches % args.save_every == 0:
             df.to_parquet(out_path, index=False)
-            logging.info("Checkpointed → %s", out_path)
+            logging.info("Checkpointed → %s (every %d batches)",
+                         out_path, args.save_every)
 
     df.to_parquet(out_path, index=False)
     elapsed = time.perf_counter() - t0
