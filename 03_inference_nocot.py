@@ -405,36 +405,67 @@ def _log_lcp_debug(tokenizer, sample_texts: list[str],
     logging.info("=" * 80)
 
 
+def _single_sample_lcp(tokenizer, sample_text: str, sample_ids: list[int]
+                       ) -> tuple[int, str, list[int]]:
+    """Probe-with-1-row helper: compare against a system-only chat-template render.
+
+    Returns (lcp_token_len, sys_text, sys_ids). On failure returns (0, "", []).
+    """
+    try:
+        sys_text = tokenizer.apply_chat_template(
+            [{"role": "system", "content": SYSTEM_CONTENT}],
+            add_generation_prompt=False, tokenize=False,
+        )
+        sys_ids = tokenizer.encode(sys_text, add_special_tokens=False)
+        lcp = 0
+        for i in range(min(len(sys_ids), len(sample_ids))):
+            if sys_ids[i] != sample_ids[i]:
+                break
+            lcp = i + 1
+        return lcp, sys_text, sys_ids
+    except Exception as e:  # noqa: BLE001
+        logging.warning("Single-sample prefix probe failed: %s", e)
+        return 0, "", []
+
+
+def run_lcp_debug(tokenizer, sample_texts: list[str]) -> None:
+    """Always-on debug printer: dumps two probe prompts and where they diverge.
+
+    Works for single-sample probes too (diffs against the system-only render).
+    """
+    logging.info("LCP DEBUG: probe batch has %d sample(s).", len(sample_texts))
+    if not sample_texts:
+        return
+    token_lists = [tokenizer.encode(t, add_special_tokens=False) for t in sample_texts]
+    if len(token_lists) >= 2:
+        lcp = find_lcp_tokens(token_lists)
+        _log_lcp_debug(tokenizer, sample_texts, token_lists, lcp)
+    else:
+        lcp, sys_text, sys_ids = _single_sample_lcp(
+            tokenizer, sample_texts[0], token_lists[0]
+        )
+        if not sys_ids:
+            return
+        logging.info("LCP DEBUG: only 1 sample — diffing against system-only render.")
+        _log_lcp_debug(
+            tokenizer,
+            [sample_texts[0], sys_text],
+            [token_lists[0], sys_ids],
+            lcp,
+        )
+
+
 def setup_prefix_cache(model, tokenizer, sample_texts: list[str],
                        include_base: bool,
-                       min_tokens: int = MIN_PREFIX_CACHE_TOKENS,
-                       debug_lcp: bool = False) -> PrefixCacheState:
+                       min_tokens: int = MIN_PREFIX_CACHE_TOKENS) -> PrefixCacheState:
     """Detect shared prefix from rendered prompts and precompute KV caches."""
     state = PrefixCacheState()
     token_lists = [tokenizer.encode(t, add_special_tokens=False) for t in sample_texts]
 
     if len(token_lists) >= 2:
         lcp = find_lcp_tokens(token_lists)
-        if debug_lcp:
-            _log_lcp_debug(tokenizer, sample_texts, token_lists, lcp)
     elif len(token_lists) == 1:
-        # Single sample: probe with a system-only chat-template render and use
-        # the LCP between that and the sample's tokens. The system block is the
-        # only truly-shared chunk we can be sure about a priori.
-        try:
-            sys_text = tokenizer.apply_chat_template(
-                [{"role": "system", "content": SYSTEM_CONTENT}],
-                add_generation_prompt=False, tokenize=False,
-            )
-            sys_ids = tokenizer.encode(sys_text, add_special_tokens=False)
-            lcp = 0
-            for i in range(min(len(sys_ids), len(token_lists[0]))):
-                if sys_ids[i] != token_lists[0][i]:
-                    break
-                lcp = i + 1
-        except Exception as e:  # noqa: BLE001
-            logging.warning("Single-sample prefix probe failed: %s", e)
-            lcp = 0
+        lcp, _, _ = _single_sample_lcp(tokenizer, sample_texts[0], token_lists[0])
     else:
         return state
 
@@ -647,20 +678,23 @@ def main() -> None:
     model, tokenizer = load_model_with_adapter(args.model_dir, args.adapter_dir)
     logging.info("Model + adapter loaded from %s", args.adapter_dir)
 
-    # Probe the first batch to seed the shared-prefix DynamicCache.
+    # Build probe texts up-front so debug + cache setup can both use them.
+    probe_idx = pending[: args.batch_size]
+    probe_rows = [df.loc[i].to_dict() for i in probe_idx]
+    probe_texts = texts_for_rows(
+        tokenizer, probe_rows,
+        reasoning_effort=args.reasoning_effort,
+        max_transcript_chars=args.max_transcript_chars,
+    )
+
+    if args.debug_lcp:
+        run_lcp_debug(tokenizer, probe_texts)
+
     cache_state = PrefixCacheState()
     if not args.no_prefix_cache:
-        probe_idx = pending[: args.batch_size]
-        probe_rows = [df.loc[i].to_dict() for i in probe_idx]
-        probe_texts = texts_for_rows(
-            tokenizer, probe_rows,
-            reasoning_effort=args.reasoning_effort,
-            max_transcript_chars=args.max_transcript_chars,
-        )
         cache_state = setup_prefix_cache(
             model, tokenizer, probe_texts,
             include_base=args.include_base,
-            debug_lcp=args.debug_lcp,
         )
 
     t0 = time.perf_counter()
