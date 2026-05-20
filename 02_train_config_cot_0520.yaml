@@ -1,0 +1,127 @@
+# TSE SFT training run config — TEACHER-COT VARIANT (2025-05-20).
+# Loaded by `02_sft_training_cot_0520.py --config <path>`.
+# CLI flags override individual values.
+#
+# Differences from `02_train_config_nocot.yaml`:
+#   - Adds analysis-channel supervision (teacher CoT).
+#   - Prompt templates (system + user) live in this YAML, not in Python.
+#   - `include_previous_call_summary` toggle drops the PREV section at render.
+#   - `objection_summary` is dropped from the input fields.
+#   - Default model is gpt-oss-20B; swap `model_dir` for 120B without other changes.
+#   - Channel loss weights default to literal half/half (0.5 / 0.5).
+#   - No in-script train/val split: all rows train; pick the right checkpoint
+#     by running 03_inference_cot_0520.py against your held-out test set.
+
+# ---- paths ----
+model_dir: /path/to/gpt-oss-20b           # swap to /path/to/gpt-oss-120b for the larger model
+input: data/preprocessed.jsonl
+output_dir: checkpoints_cot_0520
+
+# ---- prompt templates ----
+# The gpt-oss Harmony chat template auto-routes `{"role": "system"}` content into
+# the `developer` block under `# Instructions`. You still author your task
+# instructions here as `system_prompt`; the script handles the rest. The first
+# rendered prompt is logged at startup so you can verify visually.
+system_prompt: |
+  You are an outbound sales agent on the TSE channel. You will be given the
+  customer's context (customer information + product context), a summary of prior
+  calls with this customer, a summary of how the current call has gone so far,
+  and the verbatim transcript of the current call up to the latest customer turn.
+
+  Reason about how to respond to the customer in the analysis channel, then
+  produce the agent turn you would say next in the final channel. In analysis,
+  reason in first person present tense as the agent would think silently between
+  hearing the customer and choosing what to say — flowing natural prose, no
+  bullets, no headers, no enumerated steps. Reason as much as the case warrants
+  and no more. In the final channel, produce ONE natural agent turn — what you
+  would actually say next, in the words you would speak.
+
+# Python format-string template. Available placeholders:
+#   {customer_context}, {previous_calls_summary}, {current_call_summary}, {transcript}
+#
+# The <<PREV_CALL_SECTION>> ... <<END>> markers delimit the optional
+# previous-calls block. When `include_previous_call_summary: false`, the entire
+# block (markers + body) is stripped before format-substitution, and
+# {previous_calls_summary} is not requested from the row. When true, just the
+# marker lines are removed and the body is kept.
+user_prompt_template: |
+  CUSTOMER CONTEXT:
+  {customer_context}
+
+  <<PREV_CALL_SECTION>>
+  PREVIOUS CALL SUMMARY:
+  {previous_calls_summary}
+  <<END>>
+
+  CURRENT CALL SUMMARY:
+  {current_call_summary}
+
+  CURRENT TRANSCRIPT (up to the latest customer turn):
+  {transcript}
+
+include_previous_call_summary: true       # set false to drop the PREV section entirely
+
+# ---- data field names in the JSONL ----
+transcript_field: transcript
+previous_call_summary_field: previous_calls_summary    # NOTE: plural, per 01_preprocessing.py
+current_call_summary_field: current_call_summary
+customer_context_field: customer_context               # pre-rendered upstream
+analysis_target_field: teacher_cot                     # analysis-channel SFT target
+final_target_field: polished_response                  # final-channel SFT target
+
+# ---- tokenization ----
+# Char-based transcript trim: keep at most this many characters from the END
+# of the transcript (~2000 words at 6 chars/word).
+max_transcript_chars: 12000
+max_seq_len: 4096
+max_samples: null    # smoke-test cap; null = use all
+
+# ---- channel loss weights ----
+# Per-example per-channel-mean formulation:
+#   loss_a = mean(ce[mask == 1])
+#   loss_f = mean(ce[mask == 2])
+#   loss   = w_analysis * loss_a + w_final * loss_f      (per example)
+# Batch loss = mean(per-example loss across the batch).  ← .mean() is in code.
+# Defaults below give literal half/half (total magnitude ~ a single-channel loss).
+w_analysis: 0.5
+w_final: 0.5
+
+# ---- LoRA ----
+lora_r: 16
+lora_alpha: 32
+lora_dropout: 0.0
+lora_target_modules:
+  - q_proj
+  - k_proj
+  - v_proj
+  - o_proj
+
+# ---- optimization ----
+learning_rate: 1.0e-5
+lr_scheduler_type: cosine
+warmup_ratio: 0.03
+weight_decay: 0.0
+per_device_train_batch_size: 1
+gradient_accumulation_steps: 8        # effective batch = 1 * 8 * num_gpus
+num_train_epochs: 3
+gradient_checkpointing: true
+max_grad_norm: 1.0
+optim: adamw_torch_fused
+
+# ---- checkpointing & logging ----
+# Checkpoint cadence is in OPTIMIZER STEPS, not raw rows.
+# One optimizer step processes:
+#   per_device_train_batch_size * gradient_accumulation_steps * num_gpus
+# = 1 * 8 * N rows with the defaults above. So `save_steps: 30` with N GPUs
+# writes a checkpoint every 240 * N training rows. Halve for tighter cadence,
+# double for fewer dirs. `save_total_limit` rolls oldest checkpoints out —
+# raise it if you want every checkpoint preserved for later A/B on a held-out
+# test set via 03_inference_cot_0520.py --adapter-dir checkpoints_cot_0520/checkpoint-N.
+save_steps: 30
+save_total_limit: 10
+logging_steps: 5
+report_to: tensorboard
+
+# ---- misc ----
+seed: 42
+bf16: true
